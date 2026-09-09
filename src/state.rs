@@ -1,3 +1,5 @@
+pub(crate) mod checkpoint;
+
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -85,7 +87,7 @@ pub struct PendingToolCall {
     pub source_tool_assistant_uuid: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileState {
     pub size: u64,
     pub mtime: i64,
@@ -234,18 +236,20 @@ impl Default for IngestState {
 impl IngestState {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         crate::profiling::span!("state.ingest.load");
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let data = fs::read_to_string(path)?;
-        let state = serde_json::from_str(&data)?;
-        Ok(state)
+        checkpoint::CheckpointReader::open(path)?.snapshot()
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         crate::profiling::span!("state.ingest.save");
-        let data = serde_json::to_string_pretty(self)?;
-        atomic_write(path, data.as_bytes())
+        checkpoint::save_legacy(self, path)
+    }
+
+    pub fn save_with_lease(
+        &self,
+        path: &Path,
+        lease: &crate::lease::IngestLease,
+    ) -> anyhow::Result<()> {
+        checkpoint::CheckpointWriter::open(path, lease, true)?.replace_snapshot(self)
     }
 }
 
@@ -331,7 +335,11 @@ mod tests {
         assert!(
             fs::read_dir(temp.path())
                 .expect("read tempdir")
-                .all(|entry| entry.expect("directory entry").path() == path)
+                .all(|entry| {
+                    let path = entry.expect("directory entry").path();
+                    path.file_name() == Some(std::ffi::OsStr::new("ingest.json"))
+                        || path.file_name() == Some(std::ffi::OsStr::new(".checkpoints.lock"))
+                })
         );
     }
 

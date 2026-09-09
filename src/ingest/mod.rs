@@ -1,3 +1,5 @@
+mod checkpoint;
+use checkpoint::CheckpointSession;
 mod execution;
 mod publication;
 use discovery::*;
@@ -14,7 +16,7 @@ use crate::index::SearchIndex;
 use crate::lease::IngestLease;
 use crate::progress::{Progress, SOURCE_COUNT};
 use crate::state::{
-    FileIdentity, FileState, IngestState, PendingIngest, PendingToolCall, ScanCache, SessionScope,
+    FileIdentity, FileState, PendingIngest, PendingToolCall, ScanCache, SessionScope,
 };
 #[cfg(test)]
 use crate::types::RecordLinks;

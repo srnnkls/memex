@@ -1059,7 +1059,6 @@ pub(super) fn execute_refresh(
     let discovery::PreparedRefresh {
         full_scan,
         scan_cache,
-        state_path,
         mut state,
         recovering_pending_ingest,
         empty_index_rebuild,
@@ -1128,12 +1127,7 @@ pub(super) fn execute_refresh(
         crate::profiling::count!("ingest.noop_returns", 1);
         index.publish_generation_if_uninitialized()?;
         state.opencode_databases = installed_opencode_states;
-        if recovering_pending_ingest || empty_index_rebuild || identities_changed {
-            state.save(&state_path)?;
-        }
-        if opencode_database_state_changed {
-            state.save(&state_path)?;
-        }
+        state.commit()?;
         if let Some(scan_cache) = scan_cache {
             update_scan_cache(paths, files_scanned, total_bytes, scan_cache)?;
         }
@@ -1363,11 +1357,11 @@ pub(super) fn execute_refresh(
         }
 
         for (path, update) in updated_files {
-            state.files.insert(path, update);
+            state.upsert_file(path, update);
         }
         state.opencode_databases = installed_opencode_states;
         state.next_doc_id = next_doc_id.load(Ordering::SeqCst);
-        state.save(&state_path)?;
+        state.commit()?;
 
         if let Some(scan_cache) = scan_cache {
             update_scan_cache(paths, files_scanned, total_bytes, scan_cache)?;

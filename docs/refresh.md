@@ -18,7 +18,7 @@
 - `AnalyticsWriter::prepare`: resolves session facts and labels before SQL persistence. The returned prepared batch borrows the writer until commit, preventing interleaved accumulation. Deletions and inserts commit in one transaction.
 - `MemoryStore::prepare_refresh`: produces a prepared snapshot while holding its write lock; publication is a separate operation.
 
-The existing ingestion lease is retained across observation and execution. Checkpoints are loaded under that lease, so competing refreshes re-observe committed state. Read-only searches remain independent of the indexing writer.
+The existing ingestion lease is retained across observation and execution. Checkpoints are loaded under that lease, so competing refreshes re-observe committed state. Read-only searches remain independent of the indexing writer. The [checkpoint storage contract](checkpoint-storage.md) defines sparse reads/deltas, migration, lifecycle locking, and recovery ordering.
 
 ## Cost contracts
 

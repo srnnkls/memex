@@ -1,5 +1,62 @@
 # Foreground merge cost model
 
+## Per-file checkpoints: 158.96 to 148.77 ms including adoption
+
+2026-09-09. Per-file checkpoint persistence lowers adoption-inclusive aggregate elapsed time by 6.41% against the preserved cleanup candidate. Both are 0.18.1 builds; the baseline is the uncommitted cleanup build, not the older globally installed executable. The [checkpoint storage contract](checkpoint-storage.md) defines the schema, migration, lifecycle protection, compatibility, and retained recovery boundaries.
+
+| Repeat | Variant | 260 appends + queries, including first use | Terminal index/SQLite maintenance + final query | Total charged wall time |
+|---|---|---:|---:|---:|
+| 0 | Cleanup baseline | 37.60787 s | 3.61144 s | 41.21931 s |
+| 0 | Candidate | 33.95920 s | 3.64878 s | 37.60798 s |
+| 1 | Cleanup baseline | 37.83805 s | 3.60054 s | 41.43859 s |
+| 1 | Candidate | 35.85899 s | 3.89271 s | 39.75170 s |
+
+The reductions are 8.76% and 4.07%. Combined totals are 82.65789 versus 77.35968 seconds across 520 twenty-record updates per variant: 158.96 versus 148.77 ms per update, including query, first-use migration, and terminal maintenance. Candidate terminal work costs more in both repetitions and remains fully charged. All 2,088 measured subprocesses are included; no outliers are excluded.
+
+Each repetition starts both variants from the same legacy JSON checkpoint seed. Candidate migration occurs inside its first timed index call, without preparatory ingestion. First index calls are 1,284.607 versus 1,409.229 ms in repeat 0 and 1,190.365 versus 2,422.767 ms in repeat 1. Those calls include initial index merging, process startup and host effects; their differences are not isolated migration costs.
+
+A supplementary after-first-update view removes each variant's first index/query pair, retains terminal costs, and divides by 259 cycles per repetition: 154.69 versus 141.83 ms, 8.31% lower. This is not the acceptance total or a mathematically migration-subtracted result.
+
+### Complete state and deferred work
+
+The common seed retains all 7,857 checkpoint entries and 740,555 live documents in 58 index segments. Each variant receives 260 successive twenty-record Claude appends and exact-record queries. Pair and terminal order reverse across repetitions. Embeddings and automatic query indexing are disabled. No provider data, checkpoint inventory, or indexing work is pruned for timing.
+
+During measurement, SQLite validation reads only allocator/current-source state, counts and the small OpenCode map. Complete checkpoint artifacts are APFS-cloned after operations; full payload export/equality validation waits until all timed work finishes. All 2,092 snapshot receipts reconcile with unchanged query/maintenance state, preserved unrelated rows, exact allocation and offset progression, and matching paired logical-state hashes.
+
+Candidate native terminal maintenance includes completed `wal_checkpoint(TRUNCATE)` as well as the index merge. Its receipt is emitted only after successful completion; WAL bytes are zero after maintenance and the final query. Both index and database deferred work are charged.
+
+All four final index endpoints match: 745,755 live documents in four segments, the same three retained partitions, and one deletion-free 42,939-document remainder. Stored-document fingerprint: `65b03baf7b8e7c3af8f3d96262b4b5a081c59de604ff5f26ffd5b37cd2dfbf6d`. Full index fingerprints run after all timing. The controlled source is restored afterward.
+
+A real older baseline executable was also run against a disposable migrated smoke fixture. It refused the new marker without changing `CURRENT`, marker bytes, or complete logical checkpoint state. This confirms fail-closed ordinary ingestion; it does not make stale JSON backup restoration a safe rollback.
+
+### Paired trace and CPU explanation
+
+The separate diagnostic cohort covers 260 index/query cycles per variant and terminal maintenance, with same-invocation CPU captures at steps 0, 127, 255, and 259 and the terminal helper. Comparable `ingest.all` spans average 107.016 versus 91.711 ms across all calls, and 102.545 versus 86.467 ms after the first update. Those enclosing spans are diagnostic measurements, not substitutes for production totals.
+
+Every candidate index call upserts one file row, deletes none, and commits one checkpoint delta. The first call decodes zero existing SQLite file rows; each subsequent call decodes two, for 518 decoded rows across the remaining 259 calls. These counters cover row-query decoding and `commit_delta` writes, not all SQL transactions or migration's complete 7,857-row import. Read transactions and bootstrap work are outside the delta counter. Baseline lacks these counters; their absence is not zero baseline work.
+
+The diagnostic `state.checkpoint.migrate` span is 157.332 ms. It begins after initial authority parsing, then includes the migration region through activation/reopen; it is neither complete first-use overhead nor a production migration-only measurement. The diagnostic terminal WAL-maintenance span is 18.389 ms, already inside charged native terminal work. Neither span is subtracted from adoption-inclusive acceptance.
+
+Candidate SQLite open and checkpoint-commit wall time are not separately instrumented. Baseline JSON load/save spans cannot be compared with `load_files` alone to claim that all former checkpoint cost disappeared. That attribution gap remains explicit.
+
+All ten CPU captures conserve positive sampled thread-CPU weights, with zero missing-stack CPU. The five sampled pairs total 4,551.527 versus 4,581.311 CPU-ms; initial candidate capture includes migration work. Initial and terminal graphs retain substantial `IndexMerger`, FST, and postings work; terminal merge stacks represent 94.54% versus 94.07% of sampled CPU. Step 259 has zero merge CPU. Inclusive categories overlap and cannot be summed. Six initial/step-127/terminal PNGs were rendered at 1600 px and visually inspected; widths are CPU, not elapsed occupancy or physical I/O wait.
+
+Production append-index savings total 5.72076 seconds and are partially offset by higher query and terminal costs. Candidate after-first-update diagnostic means still include publication at 32.366 ms, staging at 8.613 ms, reader opening at 6.166 ms, pending-intent save at 9.464 ms, and scan-cache save at 9.908 ms. These spans overlap and must not be summed into a synthetic command total.
+
+`analysis/{production.json,diagnostic.json,traces.json,attribution.json}` retains the measurements and their scope. Four physical final checkpoint fixtures were re-read after timing and matched deferred exports exactly, with candidate WALs still empty (`analysis/final-physical-checkpoint-verification.json`).
+
+### Identity, validation, and limits
+
+Baseline production SHA-256 is `e9f9ded48deaa70538b074217e4b2a9879fc44595ca84068f8057eaa665c3e50`, imported with original receipts from the cleanup experiment. All 206 non-document inputs match the preserved uncommitted baseline. Candidate production SHA-256 is `72d891122d3b1464997830c550b3a9bcd7794637b2b5b42ff250d4ee428d89b7`, built from the 220-input frozen source and a patch relative to that baseline. Earlier cleanup work is preserved.
+
+Both modes pass 28 state tests, 97 ingestion tests, and all five integration suites (35 default, 38 profiling). Two newly added fixtures initially reused sealed index handles; fresh-generation fixtures now verify the intended checkpoint failure/recovery and bounded-row behavior. Formatting, test compilation, Clippy, backend/integration review, and independent benchmark accounting pass.
+
+The full default library suite records 764 passes and the unchanged upstream FSEvents assertion failure; its single exact retry also fails. Profiling passes 766 library tests. Four intentional library ignores remain, with no test exclusions. These failures remain in the receipts; this is not a uniformly green suite or physical power-loss validation.
+
+Evidence is under `/Users/srnnkls/Library/Caches/memex-checkpoints-aggregate-20260909`: frozen source manifests/proofs, `baseline-import.json`, `artifact-readiness.json`, native build/test receipts, `harness-readiness.json`, and `old-binary-refusal/receipt.json`. `production/{summary.json,rows.jsonl,calls.jsonl,checkpoint-validation.json,fingerprints.jsonl,source-restoration.json}` contains complete accounting and correctness evidence.
+
+The exact benchmarked checkpoint-v1 candidate was subsequently installed globally as memex 0.18.1 (`72d891122d3b1464997830c550b3a9bcd7794637b2b5b42ff250d4ee428d89b7`); `installation.json` records the verified replacement and preserved previous executable. No live-migration command was run. Older writers must be upgraded before accessing a migrated checkpoint root. The result is specific to this corpus, append/query cadence, host and two paired repetitions. Host load/cache effects remain uncontrolled. Do not combine percentages across experiments or infer all-provider, automatic-search, or cold-cache performance from this workload.
+
 ## Unchanged cleanup: 167.26 to 160.88 ms per update
 
 2026-09-09. Skipping trailing cleanup-directory synchronization when no removal was attempted lowers charged aggregate elapsed time by 3.81% against installed `231dee2` (0.18.1). Both variants use corrected blocking waits. All data-protection barriers remain governed by the [storage contract](index-storage.md#readers-and-collection).

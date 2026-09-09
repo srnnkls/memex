@@ -14,7 +14,7 @@ pub(super) struct TranscriptDiscovery {
 pub(super) fn discover_transcripts(
     options: &IngestOptions,
     excluder: &PathExcluder,
-    state: &IngestState,
+    state: &mut CheckpointSession,
     pool: &rayon::ThreadPool,
     selected: Option<&[crate::sources::SourceFile]>,
     mut inventory: Option<&mut crate::directory_inventory::DiscoveryInventory>,
@@ -79,6 +79,14 @@ pub(super) fn discover_transcripts(
         files.extend(crate::sources::antigravity::discover());
     }
 
+    state.preload(
+        &files
+            .iter()
+            .filter(|file| !excluder.is_excluded(&file.path))
+            .map(|file| file.path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+    )?;
+    let loaded = &state.loaded;
     let session_ids = selected
         .filter(|files| {
             files.iter().any(|file| {
@@ -86,9 +94,9 @@ pub(super) fn discover_transcripts(
                     && crate::sources::codex::is_history_path(&file.path)
             })
         })
-        .map_or_else(HashSet::new, |files| {
-            selection::codex_session_ids(options, state, files)
-        });
+        .map(|files| selection::codex_session_ids(options, state, files))
+        .transpose()?
+        .unwrap_or_default();
 
     enum Observed {
         Excluded,
@@ -122,7 +130,10 @@ pub(super) fn discover_transcripts(
                     file.source,
                     options.include_reasoning,
                     &metadata,
-                    state.files.get(&key),
+                    loaded
+                        .get(&key)
+                        .expect("checkpoint path must be preloaded")
+                        .as_ref(),
                 );
                 Ok(Observed::File {
                     task: Box::new(task),
@@ -437,7 +448,7 @@ pub(super) fn discover_opencode(
     index: &SearchIndex,
     options: &IngestOptions,
     selected: Option<&[crate::sources::SourceFile]>,
-    state: &mut IngestState,
+    state: &mut CheckpointSession,
     pending_recovery: &Option<PendingIngest>,
     next_doc_id: &Arc<AtomicU64>,
 ) -> Result<Option<OpenCodeDiscovery>> {
@@ -706,6 +717,20 @@ pub(super) fn discover_opencode(
             })
             .map(|file| file.path.to_string_lossy().into_owned())
             .collect::<HashSet<_>>();
+        state.preload(
+            &opencode_files
+                .iter()
+                .filter(|file| {
+                    !excluder.is_excluded(&file.path)
+                        && !file
+                            .path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|session| owner_by_session.contains_key(session))
+                })
+                .map(|file| file.path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        )?;
         let mut legacy_cleanup = index.source_paths_with_records(&legacy_candidates)?;
         if !legacy_candidates.is_empty() {
             let analytics = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
@@ -723,7 +748,8 @@ pub(super) fn discover_opencode(
                 .unwrap_or_default();
             if owner_by_session.contains_key(session_id) {
                 let path_key = path.to_string_lossy().to_string();
-                if state.files.remove(&path_key).is_some() || legacy_cleanup.contains(&path_key) {
+                if state.contains_file(&path_key)? || legacy_cleanup.contains(&path_key) {
+                    state.delete_file(&path_key);
                     opencode_legacy_paths_to_delete.push(path_key);
                 }
                 files_skipped += 1;
@@ -741,7 +767,7 @@ pub(super) fn discover_opencode(
                 SourceKind::Opencode,
                 options.include_reasoning,
                 &meta,
-                state.files.get(&key),
+                state.file(&key),
             );
             if skip {
                 unchanged_identities.push((key, task.identity));
@@ -869,8 +895,7 @@ pub(super) fn directory_projection(options: &IngestOptions) -> Vec<u8> {
 pub(super) struct PreparedRefresh {
     pub full_scan: bool,
     pub scan_cache: Option<ScanCache>,
-    pub state_path: PathBuf,
-    pub state: IngestState,
+    pub state: CheckpointSession,
     pub recovering_pending_ingest: bool,
     pub empty_index_rebuild: bool,
     pub next_doc_id: Arc<AtomicU64>,
@@ -933,15 +958,13 @@ pub(super) fn prepare_refresh(
     let discovery_profile = crate::profiling::Scope::enter("ingest.discovery");
     let excluder = build_path_excluder(options)?;
     let mut excluded_state_paths: Vec<String> = Vec::new();
-    if full_scan {
-        state.files.retain(|key, _| {
-            if excluder.is_excluded(Path::new(key)) {
-                excluded_state_paths.push(key.clone());
-                false
-            } else {
-                true
+    if full_scan && excluder.set.is_some() {
+        for key in state.file_keys()? {
+            if excluder.is_excluded(Path::new(&key)) {
+                state.delete_file(&key);
+                excluded_state_paths.push(key);
             }
-        });
+        }
     }
     let next_doc_id = Arc::new(AtomicU64::new(state.next_doc_id));
 
@@ -964,7 +987,7 @@ pub(super) fn prepare_refresh(
     let transcripts = discovery::discover_transcripts(
         options,
         &excluder,
-        &state,
+        &mut state,
         pool,
         selected.as_ref().map(|(files, _)| files.as_slice()),
         inventory.as_mut(),
@@ -1042,20 +1065,18 @@ pub(super) fn prepare_refresh(
     // was deleted individually.
     let mut missing_state_paths = Vec::new();
     if full_scan {
-        state
-            .files
-            .retain(|path, _| match Path::new(path).metadata() {
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::NotFound
-                        && Path::new(path).parent().is_some_and(|parent| {
-                            parent.metadata().is_ok_and(|meta| meta.is_dir())
-                        }) =>
-                {
-                    missing_state_paths.push(path.clone());
-                    false
-                }
-                _ => true,
-            });
+        for path in state.file_keys()? {
+            let confirmed_missing = match Path::new(&path).metadata() {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Path::new(&path)
+                    .parent()
+                    .is_some_and(|parent| parent.metadata().is_ok_and(|meta| meta.is_dir())),
+                _ => false,
+            };
+            if confirmed_missing {
+                state.delete_file(&path);
+                missing_state_paths.push(path);
+            }
+        }
     }
 
     // Previously indexed records under now-excluded paths must be deleted even
@@ -1187,10 +1208,12 @@ pub(super) fn prepare_refresh(
     );
     let mut identities_changed = false;
     for (path, identity) in unchanged_identities {
-        if let Some(previous) = state.files.get_mut(&path)
+        if let Some(previous) = state.file(&path)
             && previous.identity != identity
         {
-            previous.identity = identity;
+            let mut updated = previous.clone();
+            updated.identity = identity;
+            state.upsert_file(path, updated);
             identities_changed = true;
         }
     }
@@ -1198,7 +1221,6 @@ pub(super) fn prepare_refresh(
     Ok(PreparedRefresh {
         full_scan,
         scan_cache,
-        state_path,
         state,
         recovering_pending_ingest,
         empty_index_rebuild,
