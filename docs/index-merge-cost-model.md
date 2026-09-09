@@ -1,6 +1,70 @@
 # Foreground merge cost model
 
-## Accepted macOS staging sync result: 285.43 to 226.53 ms per update
+## Publication preparation: 177.28 to 163.63 ms with corrected timing
+
+2026-09-09. Against freshly built rebased `9464029` (0.18.1), publication-preparation batching reduces sustained aggregate elapsed time by 7.70%. Both variants use blocking process waits; the baseline already contains shared segments, incremental tiers, and private staging batching. This comparison isolates publication preparation and does not reuse the installed 0.17.5 executable or earlier polling-based timings.
+
+| Repeat | Variant | 260 appends + queries | Terminal maintenance + final query | Total charged wall time |
+|---|---|---:|---:|---:|
+| 0 | Rebased baseline | 42.25950 s | 3.80967 s | 46.06917 s |
+| 0 | Candidate | 38.55922 s | 3.71595 s | 42.27517 s |
+| 1 | Rebased baseline | 42.38356 s | 3.73444 s | 46.11800 s |
+| 1 | Candidate | 38.60536 s | 4.20754 s | 42.81291 s |
+
+Repeat reductions are 8.24% and 7.17%. Combined charged time is 92.18717 versus 85.08808 seconds across 520 twenty-record updates per variant: 177.28 versus 163.63 ms per update, including its query and amortized terminal work. Candidate terminal maintenance plus final queries total 7.92350 seconds versus 7.54411 baseline; that additional cost stays in the result.
+
+### Work, endpoints, and identity
+
+Each repeat starts from the same complete shared-format seed: 740,555 live documents in 58 segments, with all 7,857 ingest-state entries retained. The persistent fixture receives 260 twenty-record Claude appends and a separate exact-record query after each append. Pair and terminal order reverse across repeats. Embeddings and automatic query indexing are disabled. No preparatory ingestion, state pruning, omitted calls, or outlier exclusions occur.
+
+All 2,088 charged subprocess calls reconcile with launch/exit-observation timestamps and per-case native binaries/helpers. Each variant pays its own terminal compaction. All four endpoints have 745,755 live documents, the same three retained partitions, and one deletion-free 42,939-document remainder in four segments. Full stored-document fingerprint: `f735004bd1cee1b617d5acf5e81f6fd673006e4ae25cc613c3c1c6c9c61ccdf8`. Query identities, checkpoint progression, and paired state checks match. Five seed/endpoint fingerprints run after all timing; the owned source is restored afterward.
+
+Baseline production SHA-256: `2b0d5171b3c5badf20248ae390e4a26625506c6c271b76f7ceec0f6363b15532`. Candidate production SHA-256: `a1be4e54db342d730c331738c49294ad7149e6b2c69ef1ce1bafaeaa2cd04d2a`. The [storage contract](index-storage.md#macos-staging-durability) defines the retained recovery barriers. After measurement, this exact candidate was installed at `/Users/srnnkls/.cargo/bin/memex` as version 0.18.1; `installation.json` records the verified replacement and preserved previous executable. No live-index migration was run. Later sections describe historical installations.
+
+### Paired trace and CPU explanation
+
+The separate diagnostic pass covers 260 append/query cycles per variant and both terminal endpoints. Same-invocation CPU captures accompany steps 0, 127, 255, and 259 and terminal maintenance. All ten CPU-weighted folded totals reconcile with positive Samply `threadCPUDelta` microseconds; the merge classifier excludes unrelated index-opening/policy names.
+
+| Diagnostic elapsed span, mean per append | Baseline | Candidate |
+|---|---:|---:|
+| `lexical.publish` | 50.931 ms | 37.884 ms |
+| `lexical.publication_fullsync`, nested inside publication | 0.615 ms | 4.747 ms |
+| `lexical.commit` | 2.864 ms | 2.881 ms |
+| `lexical.merge_wait` | 5.799 ms | 5.941 ms |
+| `state.ingest.load` | 7.166 ms | 7.172 ms |
+| `state.ingest.save` | 16.295 ms | 16.054 ms |
+| `state.pending.save` | 9.600 ms | 9.888 ms |
+| `state.scan_cache.save` | 9.307 ms | 9.416 ms |
+
+Publication spans total 13.24199 versus 9.84988 seconds, a 25.62% reduction in this diagnostic cohort. The strict final barrier gets more expensive because it now drains the preparation batch; its cost is already inside publication. It must not be added again. Staging stays near 9.2 ms per append. Publication and full-state persistence remain substantial costs.
+
+At sampled step 127, publication falls from 64.043 to 44.953 ms while total sampled CPU is 99.910 versus 101.148 CPU-ms. Initial merge CPU is 991.200 versus 994.679 CPU-ms; terminal merge CPU is 3,419.280 versus 3,444.437 CPU-ms. The initial and terminal flamegraphs retain the same dominant `IndexMerger`, FST-building/traversal, and postings work. Step 259 has zero merge CPU in both variants. Merge schedules match across all four production sequences, so reduced merge work does not explain this result. Inclusive CPU categories overlap and cannot be summed.
+
+Every observed append/terminal publication has seven additional wrapped `fsync` calls and unchanged `lexical.full_syncs=1`. Seven is conditional on the owner/metadata branches; the full-sync counter still covers only the strict final capability barrier, not all remaining full-device flushes.
+
+Production append indexing averages 142.833 versus 128.747 ms, and following queries average 19.942 versus 19.646 ms. Native terminal maintenance averages 3,756.042 versus 3,946.845 ms: 5.08% more candidate time, fully charged. These production operation means are separate from instrumented span timings. No CPU subtraction is used to estimate I/O wait.
+
+`analysis/{production.json,diagnostic.json,traces.json,publication-attribution.json}` retains the combined accounting and attribution. Matching `.cpu-us.folded`, `.cpu.json`, and `.cpu.svg` files describe the five sampled pairs. Six initial/step-127/terminal PNGs were rendered at 1600 px under `analysis/png/` and visually inspected; their widths represent sampled CPU, not elapsed time.
+
+### Validation and limits
+
+Both candidate builds pass all 10 focused durability tests, including preparation/barrier failure and retry, exact preparation ordering, manifest-temp cleanup, device rejection, and fallback. Baseline and candidate integration suites pass 35 default and 38 profiling-enabled tests. Formatting, test compilation, Clippy, source review, and independent production-accounting review pass.
+
+The complete library suites are not uniformly green: the unchanged upstream `watch::tests::fsevents_defers_modify_until_close` assertion fails when modify events arrive with the descriptor still open. Baseline default reports 724 passed/1 failed and both bounded retries fail; baseline profiling passes 726. Candidate default reports 726 passed/1 failed, followed by a passing exact retry; candidate profiling reports 727 passed/1 failed and its exact retry fails. Four intentional library ignores remain in every run. No tests are excluded, and no security checks are relaxed; canonical `TMPDIR` avoids the earlier OAuth path-alias failures. These watcher failures are retained, not reclassified as passing checks.
+
+The result covers this corpus, host, append size, query cadence, and two production repetitions. It is not a statistical bound, a cold-cache guarantee, or a measurement of automatic-search or all-provider discovery. No physical power-loss test was performed, and the advisor's 95 ms projection remains unverified. Old polling-based percentages cannot be added to this reduction or compared directly with these per-update values.
+
+Receipts are under `/Users/srnnkls/Library/Caches/memex-publication-aggregate-20260909`: `artifact-readiness.json`, frozen-source manifests/proofs, per-binary identities, `native-build-test-handoff.json`, `harness-readiness.json`, and `calibration/receipt.json` identify the build, validation, and timer. `production/{summary.json,rows.jsonl,calls.jsonl,fingerprints.jsonl,source-restoration.json}` retains the complete workload accounting and data checks.
+
+## Historical timing correction
+
+The earlier production tables below include subprocess-observation delay. Their harness used Python 3.13 `subprocess.run(timeout=1800)` with file-backed output; timed waiting polls with sleeps up to 50 ms. Observing process exit can therefore lag behind completion, with a duration-dependent bias that can differ between variants. The reported 20.63%, 66.10%, and 8.32% reductions are not validated pure command-latency reductions. They must not be used as a baseline for corrected measurements or adjusted by subtracting an estimated delay.
+
+The replacement harness uses blocking process waits and an independent deadline with owned process-group cleanup. A 40-call native calibration retained all observations: median delay from the child's completion marker to parent observation was 10.6182 ms with timed polling and 0.4471 ms with blocking waits. These calibration values are not memex measurements or corrections to historical rows. Timeout/interruption, signal inheritance, and source-restoration checks passed. Receipts are under `/Users/srnnkls/Library/Caches/memex-publication-aggregate-20260909`, referenced by `harness-readiness.json`.
+
+Historical raw rows remain intact. Their document-equivalence checks and same-invocation trace/CPU evidence remain useful; the external stopwatch totals have the limitation above.
+
+## Historical staging-sync result: 285.43 to 226.53 ms per update
 
 2026-09-09. Batching private lexical staging synchronization reduces total charged production time by 20.63% against the installed shared-storage build. Amortized cost falls from 285.43 to 226.53 ms per twenty-record update, including its query and terminal compaction. This is an additional comparison against the installed baseline, not a new measurement against upstream; percentages from separate experiments must not be added.
 

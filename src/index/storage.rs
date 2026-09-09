@@ -12,6 +12,30 @@ pub(super) const FORMAT: &str = ".storage-format";
 const FORMAT_VERSION: &str = "memex-shared-segments-v1\n";
 const STORE: &str = "segments";
 
+#[derive(Default)]
+struct PublicationSync {
+    #[cfg(target_os = "macos")]
+    durability: Option<Arc<StagingDurability>>,
+}
+
+impl PublicationSync {
+    fn file(&self, file: &File) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        if let Some(durability) = &self.durability {
+            return durability.sync_file(file);
+        }
+        file.sync_data()
+    }
+
+    fn directory(&self, path: &Path) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        if let Some(durability) = &self.durability {
+            return durability.sync_directory(path);
+        }
+        sync_directory(path)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Manifest {
     version: u32,
@@ -51,20 +75,20 @@ impl Manifest {
         Ok(Some(parsed))
     }
 
-    fn write(&self, directory: &Path, durable: bool) -> Result<()> {
+    fn write(&self, directory: &Path, sync: Option<&PublicationSync>) -> Result<()> {
         let mut file = tempfile::NamedTempFile::new_in(directory)?;
         serde_json::to_writer(file.as_file_mut(), self)?;
-        if durable {
-            file.as_file_mut().sync_data()?;
+        if let Some(sync) = sync {
+            sync.file(file.as_file())?;
         }
         file.persist(directory.join(MANIFEST))
             .map_err(|error| error.error)?;
         if !directory.join(FORMAT).exists() {
             fs::write(directory.join(FORMAT), FORMAT_VERSION)?;
         }
-        if durable {
-            File::open(directory.join(FORMAT))?.sync_data()?;
-            sync_directory(directory)?;
+        if let Some(sync) = sync {
+            sync.file(&File::open(directory.join(FORMAT))?)?;
+            sync.directory(directory)?;
         }
         Ok(())
     }
@@ -196,7 +220,7 @@ impl SharedDirectory {
                 }
             }
         }
-        manifest.write(destination, false)?;
+        manifest.write(destination, None)?;
         Self::open(root, destination, false)?.ok_or_else(|| anyhow!("missing staging manifest"))
     }
 
@@ -212,7 +236,7 @@ impl SharedDirectory {
         view.created.clear();
         view.deleted.clear();
         view.durable_metadata.clear();
-        view.manifest.write(&view.path, false)
+        view.manifest.write(&view.path, None)
     }
 
     pub fn prepare_publication(
@@ -222,6 +246,10 @@ impl SharedDirectory {
         committed: &HashSet<PathBuf>,
     ) -> Result<()> {
         let mut view = self.view.write().unwrap();
+        let sync = PublicationSync {
+            #[cfg(target_os = "macos")]
+            durability: view.durability.clone(),
+        };
         let mut next = Manifest::empty();
         for path in committed {
             if metadata_file(path) {
@@ -244,13 +272,13 @@ impl SharedDirectory {
                 next.files.insert(name.to_owned(), inherited.clone());
             }
         }
-        sync_owner(root, owner)?;
+        sync_owner(root, owner, &sync)?;
         for name in ["meta.json", ".managed.json"] {
             if !view.durable_metadata.contains(Path::new(name)) && view.path.join(name).is_file() {
-                File::open(view.path.join(name))?.sync_data()?;
+                sync.file(&File::open(view.path.join(name))?)?;
             }
         }
-        next.write(&view.path, true)?;
+        next.write(&view.path, Some(&sync))?;
         view.manifest = next;
         Ok(())
     }
@@ -330,11 +358,11 @@ fn adopt_file(root: &Path, owner: &str, name: &Path, source: &Path) -> Result<()
     Ok(())
 }
 
-fn sync_owner(root: &Path, owner: &str) -> Result<()> {
+fn sync_owner(root: &Path, owner: &str, sync: &PublicationSync) -> Result<()> {
     let directory = root.join(STORE).join(owner);
     if directory.is_dir() {
-        sync_directory(&directory)?;
-        sync_directory(&root.join(STORE))?;
+        sync.directory(&directory)?;
+        sync.directory(&root.join(STORE))?;
     }
     Ok(())
 }

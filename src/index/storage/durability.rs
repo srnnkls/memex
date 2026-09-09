@@ -142,8 +142,12 @@ impl StagingDurability {
         Ok(())
     }
 
+    pub(super) fn sync_file(&self, file: &File) -> io::Result<()> {
+        self.synchronize(file, false)
+    }
+
     pub(super) fn sync_directory(&self, directory: &Path) -> io::Result<()> {
-        self.synchronize(&File::open(directory)?, false)
+        self.sync_file(&File::open(directory)?)
     }
 }
 

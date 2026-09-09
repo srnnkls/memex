@@ -93,16 +93,88 @@ fn failed_atomic_sync_keeps_previous_bytes_and_removes_temporary_file() {
 }
 
 #[test]
-fn failed_full_sync_keeps_current_and_old_segments_until_successful_retry() {
+fn failed_publication_sync_keeps_current_and_old_segments_until_successful_retry() {
+    for fail_full in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let first = SearchIndex::open_or_create_for_ingest(temp.path()).unwrap();
+        add(&first, 1);
+        first.publish_generation().unwrap();
+        let old_current = fs::read(temp.path().join(CURRENT_FILE)).unwrap();
+        let old_generation = resolve_current_generation(temp.path()).unwrap();
+        let update = SearchIndex::open_or_create_for_ingest(temp.path()).unwrap();
+        add(&update, 2);
+        let pending = update.pending_generation.as_ref().unwrap();
+        let durability = pending
+            .directory
+            .view
+            .read()
+            .unwrap()
+            .durability
+            .clone()
+            .unwrap();
+        *durability.fail.lock().unwrap() = Some(fail_full);
+        assert!(update.publish_generation().is_err());
+        assert_eq!(
+            fs::read(temp.path().join(CURRENT_FILE)).unwrap(),
+            old_current
+        );
+        assert!(pending.staging_dir.exists());
+        assert!(old_generation.is_dir());
+        assert!(!pending.published.load(AtomicOrdering::Acquire));
+        assert_eq!(
+            SearchIndex::open_or_create(temp.path())
+                .unwrap()
+                .doc_count()
+                .unwrap(),
+            1
+        );
+        assert_eq!(first.doc_count().unwrap(), 1);
+        assert_eq!(durability.calls.lock().unwrap().last(), Some(&fail_full));
+        *durability.fail.lock().unwrap() = None;
+        update.publish_generation().unwrap();
+        assert_ne!(
+            fs::read(temp.path().join(CURRENT_FILE)).unwrap(),
+            old_current
+        );
+        assert_eq!(
+            SearchIndex::open_or_create(temp.path())
+                .unwrap()
+                .doc_count()
+                .unwrap(),
+            2
+        );
+        assert_eq!(first.doc_count().unwrap(), 1);
+        assert_eq!(
+            durability
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|&&full| full)
+                .count(),
+            1 + usize::from(fail_full)
+        );
+        assert!(
+            pending
+                .directory
+                .open_write(Path::new("sealed.store"))
+                .is_err()
+        );
+        assert!(
+            pending
+                .directory
+                .atomic_write(Path::new("meta.json"), b"sealed")
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn preparation_batches_seven_syncs_before_the_publication_barrier() {
     let temp = tempfile::tempdir().unwrap();
-    let first = SearchIndex::open_or_create_for_ingest(temp.path()).unwrap();
-    add(&first, 1);
-    first.publish_generation().unwrap();
-    let old_current = fs::read(temp.path().join(CURRENT_FILE)).unwrap();
-    let old_generation = resolve_current_generation(temp.path()).unwrap();
-    let update = SearchIndex::open_or_create_for_ingest(temp.path()).unwrap();
-    add(&update, 2);
-    let pending = update.pending_generation.as_ref().unwrap();
+    let index = SearchIndex::open_or_create_for_ingest(temp.path()).unwrap();
+    add(&index, 1);
+    let pending = index.pending_generation.as_ref().unwrap();
     let durability = pending
         .directory
         .view
@@ -111,15 +183,12 @@ fn failed_full_sync_keeps_current_and_old_segments_until_successful_retry() {
         .durability
         .clone()
         .unwrap();
-    *durability.fail.lock().unwrap() = Some(true);
-    assert!(update.publish_generation().is_err());
+    durability.calls.lock().unwrap().clear();
+    index.publish_generation().unwrap();
     assert_eq!(
-        fs::read(temp.path().join(CURRENT_FILE)).unwrap(),
-        old_current
+        *durability.calls.lock().unwrap(),
+        [false, false, false, false, false, false, false, true]
     );
-    assert!(pending.staging_dir.exists());
-    assert!(old_generation.is_dir());
-    assert!(!pending.published.load(AtomicOrdering::Acquire));
     assert_eq!(
         SearchIndex::open_or_create(temp.path())
             .unwrap()
@@ -127,44 +196,22 @@ fn failed_full_sync_keeps_current_and_old_segments_until_successful_retry() {
             .unwrap(),
         1
     );
-    assert_eq!(first.doc_count().unwrap(), 1);
-    assert_eq!(durability.calls.lock().unwrap().last(), Some(&true));
-    *durability.fail.lock().unwrap() = None;
-    update.publish_generation().unwrap();
-    assert_ne!(
-        fs::read(temp.path().join(CURRENT_FILE)).unwrap(),
-        old_current
-    );
-    assert_eq!(
-        SearchIndex::open_or_create(temp.path())
-            .unwrap()
-            .doc_count()
-            .unwrap(),
-        2
-    );
-    assert_eq!(first.doc_count().unwrap(), 1);
-    assert_eq!(
-        durability
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|&&full| full)
-            .count(),
-        2
-    );
-    assert!(
-        pending
-            .directory
-            .open_write(Path::new("sealed.store"))
-            .is_err()
-    );
-    assert!(
-        pending
-            .directory
-            .atomic_write(Path::new("meta.json"), b"sealed")
-            .is_err()
-    );
+}
+
+#[test]
+fn failed_manifest_sync_preserves_previous_manifest_and_cleans_temporary_file() {
+    let (_temp, directory, durability) = staging();
+    let path = directory.view.read().unwrap().path.clone();
+    let previous = fs::read(path.join(MANIFEST)).unwrap();
+    let files_before = fs::read_dir(&path).unwrap().count();
+    let sync = PublicationSync {
+        durability: Some(Arc::clone(&durability)),
+    };
+    *durability.fail.lock().unwrap() = Some(false);
+    assert!(Manifest::empty().write(&path, Some(&sync)).is_err());
+    assert_eq!(fs::read(path.join(MANIFEST)).unwrap(), previous);
+    assert_eq!(fs::read_dir(&path).unwrap().count(), files_before);
+    assert_eq!(*durability.calls.lock().unwrap(), [false]);
 }
 
 #[test]
@@ -184,7 +231,7 @@ fn replaced_lease_prevents_publication() {
 
 #[test]
 fn changed_device_rejects_writes_and_full_sync() {
-    let (_temp, directory, durability) = staging();
+    let (temp, directory, durability) = staging();
     directory.set_durability(None);
     let mut durability = Arc::try_unwrap(durability).unwrap();
     durability.device ^= 1;
@@ -192,6 +239,16 @@ fn changed_device_rejects_writes_and_full_sync() {
     let path = directory.view.read().unwrap().path.clone();
     assert!(durability.sync_directory(&path).is_err());
     assert!(durability.publish(&path).is_err());
+    assert!(durability.calls.lock().unwrap().is_empty());
+    let durability = Arc::new(durability);
+    directory.set_durability(Some(Arc::clone(&durability)));
+    let owner = "00000000000000000000000000000001-00000001";
+    fs::create_dir_all(temp.path().join(STORE).join(owner)).unwrap();
+    assert!(
+        directory
+            .prepare_publication(temp.path(), owner, &HashSet::new())
+            .is_err()
+    );
     assert!(durability.calls.lock().unwrap().is_empty());
 }
 
@@ -207,12 +264,19 @@ fn unsupported_probe_uses_original_sync_but_io_errors_propagate() {
             .raw_os_error(),
         Some(libc::EIO)
     );
-    let (_temp, directory, durability) = staging();
+    let (temp, directory, durability) = staging();
     directory.set_durability(None);
     directory
         .atomic_write(Path::new("meta.json"), b"original path")
         .unwrap();
     directory.sync_directory().unwrap();
+    directory
+        .prepare_publication(
+            temp.path(),
+            "00000000000000000000000000000001-00000001",
+            &HashSet::new(),
+        )
+        .unwrap();
     directory.sync_for_publication().unwrap();
     assert!(durability.calls.lock().unwrap().is_empty());
     assert!(
