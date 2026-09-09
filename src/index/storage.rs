@@ -1,3 +1,8 @@
+#[cfg(target_os = "macos")]
+mod durability;
+#[cfg(target_os = "macos")]
+pub(super) use durability::StagingDurability;
+
 use super::*;
 use std::collections::BTreeMap;
 use std::sync::RwLock;
@@ -122,6 +127,8 @@ struct View {
     deleted: HashSet<PathBuf>,
     sealed: bool,
     _generation_lease: Option<Arc<GenerationLease>>,
+    #[cfg(target_os = "macos")]
+    durability: Option<Arc<StagingDurability>>,
 }
 
 #[derive(Clone, Debug)]
@@ -153,6 +160,8 @@ impl SharedDirectory {
                 deleted: HashSet::new(),
                 sealed,
                 _generation_lease: None,
+                #[cfg(target_os = "macos")]
+                durability: None,
             })),
         }))
     }
@@ -224,6 +233,11 @@ impl SharedDirectory {
                     bail!("new committed segment file is missing: {}", path.display());
                 }
                 adopt_file(root, owner, path, &view.path.join(path))?;
+                #[cfg(target_os = "macos")]
+                if let Some(durability) = &view.durability {
+                    durability.check_path(&root.join(STORE).join(owner))?;
+                    durability.check_path(&root.join(STORE).join(owner).join(path))?;
+                }
                 next.files.insert(name.to_owned(), owner.to_owned());
                 crate::profiling::count!("lexical.new_shared_files", 1);
             } else if let Some(inherited) = view.manifest.files.get(name) {
@@ -239,6 +253,20 @@ impl SharedDirectory {
         next.write(&view.path, true)?;
         view.manifest = next;
         Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn set_durability(&self, durability: Option<Arc<StagingDurability>>) {
+        self.view.write().unwrap().durability = durability;
+    }
+
+    pub(super) fn sync_for_publication(&self) -> Result<()> {
+        let view = self.view.read().unwrap();
+        #[cfg(target_os = "macos")]
+        if let Some(durability) = &view.durability {
+            return Ok(durability.publish(&view.path)?);
+        }
+        create_generation_lease_file(&view.path)
     }
 
     pub fn pin_generation(&self, lease: Arc<GenerationLease>) {
@@ -396,6 +424,12 @@ impl Directory for SharedDirectory {
                 path.to_path_buf(),
             ));
         }
+        #[cfg(target_os = "macos")]
+        let result = match &view.durability {
+            Some(durability) => durability.open_write(&view.path, path)?,
+            None => view.local.open_write(path)?,
+        };
+        #[cfg(not(target_os = "macos"))]
         let result = view.local.open_write(path)?;
         view.deleted.remove(path);
         view.created.insert(path.to_path_buf());
@@ -417,21 +451,41 @@ impl Directory for SharedDirectory {
 
     fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
         checked_name(path)?;
-        let local = {
-            let view = self.view.read().unwrap();
-            if view.sealed {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "sealed generation",
-                ));
-            }
-            view.local.clone()
+        let view = self.view.read().unwrap();
+        if view.sealed {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "sealed generation",
+            ));
+        }
+        let local = view.local.clone();
+        #[cfg(target_os = "macos")]
+        let staging = view
+            .durability
+            .clone()
+            .map(|durability| (durability, view.path.clone()));
+        drop(view);
+        #[cfg(target_os = "macos")]
+        let durable = if let Some((durability, directory)) = staging {
+            durability.atomic_write(&directory, path, data)?;
+            false
+        } else {
+            local.atomic_write(path, data)?;
+            true
         };
-        local.atomic_write(path, data)?;
+        #[cfg(not(target_os = "macos"))]
+        let durable = {
+            local.atomic_write(path, data)?;
+            true
+        };
         let mut view = self.view.write().unwrap();
         view.deleted.remove(path);
         if metadata_file(path) {
-            view.durable_metadata.insert(path.to_path_buf());
+            if durable {
+                view.durable_metadata.insert(path.to_path_buf());
+            } else {
+                view.durable_metadata.remove(path);
+            }
         } else {
             view.created.insert(path.to_path_buf());
         }
@@ -439,7 +493,14 @@ impl Directory for SharedDirectory {
     }
 
     fn sync_directory(&self) -> io::Result<()> {
-        self.view.read().unwrap().local.sync_directory()
+        let view = self.view.read().unwrap();
+        #[cfg(target_os = "macos")]
+        if !view.sealed
+            && let Some(durability) = &view.durability
+        {
+            return durability.sync_directory(&view.path);
+        }
+        view.local.sync_directory()
     }
 
     fn acquire_lock(&self, lock: &Lock) -> Result<DirectoryLock, LockError> {

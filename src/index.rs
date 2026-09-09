@@ -547,6 +547,9 @@ impl SearchIndex {
             .as_deref()
             .or_else(|| dir.join("meta.json").is_file().then_some(dir));
         fs::create_dir(&staging_dir)?;
+        #[cfg(target_os = "macos")]
+        let durability = storage::StagingDurability::prepare(dir, &staging_dir)?;
+        #[cfg(not(target_os = "macos"))]
         create_generation_lease_file(&staging_dir)?;
         let staging_lease = Arc::new(acquire_generation_lease(&staging_dir)?);
         let directory =
@@ -557,6 +560,8 @@ impl SearchIndex {
                     return Err(error);
                 }
             };
+        #[cfg(target_os = "macos")]
+        directory.set_durability(durability);
         directory.pin_generation(Arc::clone(&staging_lease));
         let pending = Arc::new(PendingGeneration {
             index_root: dir.to_path_buf(),
@@ -705,7 +710,7 @@ impl SearchIndex {
             .join(GENERATIONS_DIR)
             .join(&pending.generation_name);
         if pending.staging_dir.exists() {
-            create_generation_lease_file(&pending.staging_dir)?;
+            pending.directory.sync_for_publication()?;
             fs::rename(&pending.staging_dir, &final_dir)
                 .with_context(|| format!("publish index generation {}", pending.generation_name))?;
         } else if !final_dir.exists() {

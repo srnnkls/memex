@@ -1,6 +1,6 @@
 # Live refresh measurements
 
-For the subsequent matched storage comparison, see [shared-segment measurements](shared-segments-benchmark.md). For all optimizations together versus fetched upstream, including amortized per-update cost and terminal maintenance, see the [sustained cost model](index-merge-cost-model.md#current-build-versus-upstream-85671-to-29039-ms-per-update-amortized).
+For the subsequent matched storage comparison, see [shared-segment measurements](shared-segments-benchmark.md). For all optimizations together versus fetched upstream, including amortized per-update cost and terminal maintenance, see the [sustained cost model](index-merge-cost-model.md#installed-baseline-versus-upstream-85671-to-29039-ms-per-update-amortized).
 
 2026-09-08, Apple M1 Pro. Working branch: `perf/opencode-cleanup`, based on instrumentation PR #155. Measurements use the real `~/.memex` corpus and the existing configuration. The production build has profiling compiled out.
 

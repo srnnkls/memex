@@ -26,6 +26,16 @@ After the index writer finishes, new committed files enter the shared store once
 
 A failed publication leaves the previous `CURRENT` intact until the new reference set is ready. A crash after the pointer changes uses the existing ingestion recovery protocol.
 
+### macOS staging durability
+
+Private ingest generations on eligible local APFS/HFS layouts synchronize Tantivy file writes and interim directory updates with `fsync`. Eligibility requires matching device identities for the index root, generations directory, staging directory, segment store, and retained lease descriptor, plus successful `F_FULLFSYNC` support. Unsupported or cross-device layouts use the original synchronization path; non-macOS behavior is unchanged.
+
+The initial lease-file synchronization establishes eligibility. After the existing payload, owner-directory, metadata, and manifest synchronization, the pre-rename lease-file synchronization issues a strict `F_FULLFSYNC`. macOS guarantees that this drains earlier `fsync` operations on the same device. Output descriptors and adoption destinations are checked against that device; changed directory or lease identities abort publication.
+
+The generation rename and `CURRENT` replacement retain their original strong directory synchronization before reclamation. Pending-intent persistence, analytics, vectors, post-publication checkpoints, and pending-intent removal keep their existing durability boundaries. Intermediate private Tantivy commits are not independently power-loss durable; the publication boundary is.
+
+Failure-injection tests check synchronization order, unchanged `CURRENT` after a failed barrier, and safe retry. They do not simulate physical power loss.
+
 ## Readers and collection
 
 The current generation, leased readers, and live staging generations retain their shared references. Normal pruning removes unleased generations before collecting unreachable shared files. Offline GC also sweeps orphaned files and reports `shared_files_removed`.

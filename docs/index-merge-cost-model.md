@@ -1,6 +1,69 @@
 # Foreground merge cost model
 
-## Current build versus upstream: 856.71 to 290.39 ms per update, amortized
+## Accepted macOS staging sync result: 285.43 to 226.53 ms per update
+
+2026-09-09. Batching private lexical staging synchronization reduces total charged production time by 20.63% against the installed shared-storage build. Amortized cost falls from 285.43 to 226.53 ms per twenty-record update, including its query and terminal compaction. This is an additional comparison against the installed baseline, not a new measurement against upstream; percentages from separate experiments must not be added.
+
+| Repeat | Variant | 260 appends + queries | Terminal maintenance + final query | Total charged wall time |
+|---|---|---:|---:|---:|
+| 0 | Installed baseline | 69.23970 s | 4.58110 s | 73.82080 s |
+| 0 | Candidate | 54.36273 s | 4.48811 s | 58.85083 s |
+| 1 | Installed baseline | 70.26618 s | 4.33756 s | 74.60374 s |
+| 1 | Candidate | 54.51980 s | 4.42661 s | 58.94641 s |
+
+Both repetitions improve: 20.28% and 20.99%. Across 520 updates per variant, 148.42454 seconds becomes 117.79724 seconds. Candidate terminal work is slower in the second repeat and remains fully charged. All 2,088 measured subprocess calls are retained; no outliers are excluded.
+
+### Matched work and durability boundary
+
+Both variants start from the same shared-format seed: 740,555 live documents in 58 segments and the complete 7,857-entry ingest state. Each receives 260 successive twenty-record appends followed by separate queries; pair order and terminal order reverse across repeats. Embeddings and automatic indexing on query are disabled, and both index only the controlled Claude source. No preparatory ingestion or state pruning occurs.
+
+Per-variant native terminal helpers preserve the same three large segments and compact the remainder. All four endpoints match exactly: 745,755 live documents in four segments, unchanged retained partitions, and a deletion-free 42,939-document remainder. Full stored-document fingerprint: `0167bea1da08c3a97b9bd8d38c942916f6496f3045d5a1f643402772ac2bb9ad`. Five seed/endpoint fingerprints run only after every timed operation. Exact query records, checkpoint progression, and paired state hashes also match.
+
+The [storage durability contract](index-storage.md#macos-staging-durability) defines eligible layouts and publication ordering. Failure-injection tests verify ordering and retry; physical power-loss testing was not performed. The advisor's approximately 85 ms projection is not an observed result.
+
+### Paired traces and CPU flamegraphs
+
+A separate diagnostic pass completed 260 append/query cycles per variant and both native terminal endpoints. Each operation has a phase trace. CPU samples accompany the same invocations at steps 0, 127, 255, and 259, plus terminal maintenance: five pairs. Diagnostic timings are excluded from production acceptance.
+
+| Diagnostic phase, 260 append calls unless noted | Installed baseline | Candidate |
+|---|---:|---:|
+| `lexical.commit` | 12.76169 s | 0.92110 s |
+| `lexical.merge_wait` | 4.26460 s | 1.86172 s |
+| `lexical.publish` | 13.83172 s | 13.86677 s |
+| `lexical.stage` | 2.55211 s | 2.55920 s |
+| `state.pending.save` | 4.28727 s | 2.47332 s |
+| `state.ingest.save` | 4.55386 s | 4.37346 s |
+| `state.scan_cache.save` | 2.43551 s | 2.49705 s |
+| Query `cli.search`, 261 calls | 2.82596 s | 2.62291 s |
+| Terminal `benchmark.terminal_merge`, one call | 5.52554 s | 5.24063 s |
+
+Repeated commit spans fall by 11.84059 seconds; merge-wait spans fall by 2.40288 seconds. Publication and staging stay essentially unchanged. Enclosing `cli.run` falls from 54.31121 to 37.65176 seconds, but overlaps these phases and must not be added to them. Pending-state and analytics spans also improve despite unchanged code; host/cache interactions prevent assigning those differences to a separate implementation win.
+
+The same-call CPU evidence distinguishes synchronization savings from reduced indexing work. At nonmerging step 259, commit elapsed time falls from 53.884 to 3.291 ms while total sampled CPU stays nearly unchanged, 72.543 versus 72.245 CPU-ms. Initial merge CPU is 1,234.213 versus 1,249.427 CPU-ms; terminal merge CPU is 4,284.865 versus 4,185.897 CPU-ms. Both variants' initial and terminal flamegraphs remain dominated by `IndexMerger`, FST traversal/building, and postings. FST/postings categories overlap merge stacks and each other; their weights are not additive.
+
+Publication remains the largest named candidate phase at 53.334 ms per append. Ingest-state save averages 16.821 ms, pending save 9.513 ms, and scan-cache save 9.604 ms. The retained capability probe is visible in candidate step 127: 18.723 sampled CPU-ms under `durability::full_sync`/`fcntl`. Native production terminal maintenance remains approximately unchanged, averaging 4.439 versus 4.409 seconds. None of this later work is removed from the aggregate.
+
+The candidate records 4,246 wrapped staging fsyncs across append and terminal operations. `lexical.full_syncs=261` counts only the newly wrapped final publication barriers; it excludes capability probes and all other full-sync call sites. Absence of this counter in baseline does not mean baseline performs zero full flushes. The new final-barrier spans total 166.731 ms, nested inside publication.
+
+`analysis-v2/{production.json,diagnostic.json,traces.json}` and the matching `.cpu-us.folded`, `.cpu.json`, and `.cpu.svg` files contain the corrected analysis. Initial, step-127, and terminal graphs for both variants were rendered at 1600 px and visually inspected. Widths use positive Samply `threadCPUDelta` microseconds, not elapsed stack occupancy. CPU cannot be subtracted from wall time to infer physical I/O wait.
+
+The initial analyzer's broad merge classifier also matched `open_or_create_for_ingest_with_merge_policy`. The corrected classifier matches verified Tantivy merger/merge-worker symbols: step 259 now correctly has zero merge CPU in both variants. `classifier-correction.json` records the correction; all raw captures, total CPU weights, folded/SVG files, trace totals, and production acceptance are unchanged.
+
+### Identity and validation
+
+The accepted production executable is installed at `/Users/srnnkls/.cargo/bin/memex` (0.17.5), SHA-256 `c0d4e39d1950911036967f718382ca4980df269714d55cd35463c51ff6eb194a`. It replaces benchmark baseline `86d4eb09784b40b603b087d0165aa4c5de02512d8368b9d704d2a626988cd32e`, preserved with the experiment artifacts. `installation.json` records the verified replacement; no live-index migration was run. The upstream and policy-only sections below describe earlier installations and measurements.
+
+Default/profile library suites pass 671/672 tests, respectively, with four ignored and the same two documented OAuth exclusions. Default/profile CLI suites pass 2/5 tests. Eight new durability tests, formatting, and Clippy pass. Independent source and production-accounting review found no remaining defects. Builds and tests finished before production and diagnostic captures.
+
+Receipts are under `/Users/srnnkls/Library/Caches/memex-durability-aggregate-20260909`: `preservation.json`, source manifests, `candidate-build-manifest.json`, and `seed-preparation.json` identify the exact inputs; `production/{summary.json,rows.jsonl,calls.jsonl,fingerprints.jsonl,identities.json,source-restoration.json}` retain timing and correctness evidence.
+
+The initial smoke failed an overstrict harness assertion: baseline Tantivy `.managed.json` retained 77 stale entries after compaction while all committed payloads were present. `benchmark-v1.py` and `harness-correction.json` preserve that evidence. The corrected check accepts stale bookkeeping but still validates every committed manifest reference and payload; `smoke-v2-validation.json` records equal endpoints. Smoke timings do not enter acceptance.
+
+This result covers one corpus, host, append size, and query cadence with two production repetitions. It does not establish cold-cache behavior, automatic-search single-command latency, all-provider discovery cost, or a statistical bound. Host load and cache carryover remain uncontrolled.
+
+## Installed baseline versus upstream: 856.71 to 290.39 ms per update, amortized
+
+The historical comparisons below use the older broad merge-CPU classifier, which includes some index-opening/setup work through `open_or_create_for_ingest_with_merge_policy`. Those category values are not pure merger CPU. Their acceptance wall measurements and raw CPU flamegraph widths remain valid.
 
 2026-09-09. Against fetched `upstream/main` at `224e8a164e9f99f1d3fead780e067b152c7cea40` (0.18.1), the installed optimized build (0.17.5) reduces amortized index-plus-query cost, including terminal maintenance, from 856.71 to 290.39 ms per twenty-record update. Total charged time is 66.10% lower; upstream takes 2.95 times as long on this workload. Amortized cost divides the complete charged total by 520 updates per variant, not by the number of subprocesses.
 
