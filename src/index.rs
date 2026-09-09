@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod benchmark;
+#[cfg(test)]
+mod cleanup_tests;
 mod storage;
 
 use crate::state::SessionScope;
@@ -417,7 +419,13 @@ impl SearchIndex {
             dry_run,
         };
         if dry_run {
-            report.shared_files_removed = storage::collect_unreachable(dir, true)?;
+            let doomed = old_generations
+                .iter()
+                .chain(abandoned_workdirs.iter())
+                .cloned()
+                .collect::<Vec<_>>();
+            report.shared_files_removed =
+                storage::collect_unreachable_excluding(dir, true, &doomed)?;
             return Ok(report);
         }
 
@@ -2147,7 +2155,18 @@ fn acquire_generation_lease(generation: &Path) -> Result<GenerationLease> {
 }
 
 fn prune_superseded_generations(index_root: &Path, current: &str) -> Result<()> {
+    prune_superseded_generations_with_sync(index_root, current, sync_directory)
+}
+
+fn prune_superseded_generations_with_sync(
+    index_root: &Path,
+    current: &str,
+    synchronize: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<()> {
+    crate::profiling::span!("lexical.cleanup.generations");
+    crate::profiling::count!("lexical.cleanup.generations.calls", 1);
     let generations = index_root.join(GENERATIONS_DIR);
+    let mut removal_attempted = false;
     for entry in fs::read_dir(&generations)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
@@ -2170,6 +2189,7 @@ fn prune_superseded_generations(index_root: &Path, current: &str) -> Result<()> 
             let Some(_lease) = try_lock_generation_exclusive(&entry.path())? else {
                 continue;
             };
+            removal_attempted = true;
             fs::remove_dir_all(entry.path()).with_context(|| {
                 format!(
                     "remove abandoned index generation work directory {}",
@@ -2194,6 +2214,7 @@ fn prune_superseded_generations(index_root: &Path, current: &str) -> Result<()> 
             // platforms that prohibit deleting open files, leave the generation for a later pass.
             None
         };
+        removal_attempted = true;
         if let Err(error) = fs::remove_dir_all(entry.path())
             && error.kind() != io::ErrorKind::PermissionDenied
         {
@@ -2205,16 +2226,32 @@ fn prune_superseded_generations(index_root: &Path, current: &str) -> Result<()> 
             });
         }
     }
-    sync_directory(&generations)?;
+    if removal_attempted {
+        crate::profiling::count!("lexical.cleanup.generations.sync_requests", 1);
+        synchronize(&generations)?;
+    } else {
+        crate::profiling::count!("lexical.cleanup.generations.sync_skips", 1);
+    }
     Ok(())
 }
 
 fn prune_legacy_index_files(index_root: &Path) -> Result<()> {
+    prune_legacy_index_files_with_sync(index_root, sync_directory)
+}
+
+fn prune_legacy_index_files_with_sync(
+    index_root: &Path,
+    synchronize: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<()> {
+    crate::profiling::span!("lexical.cleanup.legacy");
+    crate::profiling::count!("lexical.cleanup.legacy.calls", 1);
+    let mut removal_attempted = false;
     for entry in fs::read_dir(index_root)? {
         let entry = entry?;
         if !entry.file_type()?.is_file() || entry.file_name() == CURRENT_FILE {
             continue;
         }
+        removal_attempted = true;
         if let Err(error) = fs::remove_file(entry.path())
             && error.kind() != io::ErrorKind::PermissionDenied
         {
@@ -2222,7 +2259,12 @@ fn prune_legacy_index_files(index_root: &Path) -> Result<()> {
                 .with_context(|| format!("prune legacy index file {}", entry.path().display()));
         }
     }
-    sync_directory(index_root)?;
+    if removal_attempted {
+        crate::profiling::count!("lexical.cleanup.legacy.sync_requests", 1);
+        synchronize(index_root)?;
+    } else {
+        crate::profiling::count!("lexical.cleanup.legacy.sync_skips", 1);
+    }
     Ok(())
 }
 

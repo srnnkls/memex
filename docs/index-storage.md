@@ -40,6 +40,8 @@ Failure-injection tests check synchronization order, unchanged `CURRENT` after a
 
 The current generation, leased readers, and live staging generations retain their shared references. Normal pruning removes unleased generations before collecting unreachable shared files. Offline GC also sweeps orphaned files and reports `shared_files_removed`.
 
+Each cleanup pass requests its existing trailing directory synchronization only after a removal attempt. Current/leased generations and other no-candidate passes skip that synchronization. Attempts count conservatively because recursive deletion can partially succeed before a permission error. Empty shared-owner directory removal also triggers synchronization, even when the file-removal count is zero; dry runs never synchronize. Publication and recovery barriers are unchanged. A crash after failed cleanup can leave unreachable garbage for a later scan to reclaim without invalidating the durable `CURRENT`.
+
 Malformed references, unsupported versions, traversal paths, missing referenced files, and symlinked shared data fail closed. Shared files are reclaimed only when no retained generation or staging manifest references them.
 
 ## Compatibility

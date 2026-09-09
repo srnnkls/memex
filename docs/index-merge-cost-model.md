@@ -1,5 +1,60 @@
 # Foreground merge cost model
 
+## Unchanged cleanup: 167.26 to 160.88 ms per update
+
+2026-09-09. Skipping trailing cleanup-directory synchronization when no removal was attempted lowers charged aggregate elapsed time by 3.81% against installed `231dee2` (0.18.1). Both variants use corrected blocking waits. All data-protection barriers remain governed by the [storage contract](index-storage.md#readers-and-collection).
+
+| Repeat | Variant | 260 appends + queries | Terminal maintenance + final query | Total charged wall time |
+|---|---|---:|---:|---:|
+| 0 | Installed baseline | 39.31749 s | 4.00384 s | 43.32133 s |
+| 0 | Candidate | 37.66683 s | 3.83476 s | 41.50159 s |
+| 1 | Installed baseline | 39.78992 s | 3.86171 s | 43.65163 s |
+| 1 | Candidate | 38.18654 s | 3.97013 s | 42.15667 s |
+
+Both repetitions improve: 4.20% and 3.42%. Across 520 twenty-record updates per variant, charged time is 86.97296 versus 83.65826 seconds, or 167.26 versus 160.88 ms per update including its query and amortized terminal work. Candidate terminal work costs more in the second repetition and remains included.
+
+The gain is distributed across the workload: candidate index/query pairs are faster in 226/260 and 224/260 cases, with median paired gains of 5.990 and 5.900 ms. These summaries retain every observation and do not replace the aggregate acceptance measure. Two repetitions establish a result for this workload, not a statistical bound or universal speedup.
+
+### Work, correctness, and provenance
+
+Each repeat starts both variants from the same 740,555-live-document, 58-segment shared-format seed with all 7,857 ingest-state entries. Each receives 260 successive twenty-record Claude appends and a separate exact-record query after each append. Pair and terminal order reverse across repeats. Embeddings and automatic query indexing are disabled; no preparatory ingestion, state pruning, omitted calls, or outlier exclusions occur.
+
+All 2,088 charged subprocesses reconcile with blocking-wait timestamps and pinned binary roles. Per-variant native terminal helpers retain three original partitions and merge the remainder. All four endpoints have four segments, 745,755 live documents, and a deletion-free 42,939-document remainder. Full stored-document fingerprint: `deebb938875993e83c026b2bccecbd842815e51180418ced518708685a257860`. Retained fingerprints, query records, and checkpoint progression match. Five validation calls follow all timing; the owned source is restored afterward.
+
+Baseline is the exact installed production executable, SHA-256 `a1be4e54db342d730c331738c49294ad7149e6b2c69ef1ce1bafaeaa2cd04d2a`. Its four executable/helper roles are imported from the preceding publication experiment with original compiler receipts preserved. All 205 non-document inputs match `231dee2`; only the cost-model document differs from that build's frozen source. Candidate production SHA-256 is `e9f9ded48deaa70538b074217e4b2a9879fc44595ca84068f8057eaa665c3e50`. Fresh baseline measurements were collected; previous run timings were not reused.
+
+### Paired trace and CPU explanation
+
+Separate diagnostics cover 260 append/query cycles per variant and both terminal endpoints, with same-invocation CPU samples at steps 0, 127, 255, and 259 and terminal maintenance. Across append calls, comparable `lexical.publish` spans fall from 10.27042 to 8.66788 seconds, or 15.60%. Nested strict publication synchronization stays nearly unchanged, 1.22891 versus 1.21956 seconds; staging also stays near 2.36 seconds. These parent/child spans overlap and cannot be added.
+
+Candidate cleanup counters across 261 append/terminal publications:
+
+| Cleanup pass | Calls | Trailing directory-sync requests | No-attempt skips |
+|---|---:|---:|---:|
+| Superseded generations | 261 | 261 | 0 |
+| Legacy files | 261 | 0 | 261 |
+| Shared files/owners | 261 | 34 | 227 |
+
+Generation pruning still synchronizes every publication in this workload. The 33 merge-bearing appends synchronize shared cleanup; the 227 nonmerging appends skip it. Terminal maintenance adds one shared cleanup sync and one legacy skip. These are synchronization requests, not counts of all physical full flushes. Baseline lacks the new cleanup spans/counters, so its missing values are unavailable, not zero. Both variants still record 261 strict final-generation `lexical.full_syncs` calls.
+
+CPU samples retain the original work. Initial total sampled CPU is 1,029.939 versus 1,063.490 CPU-ms, with merger stacks accounting for approximately 88–89%. Terminal CPU is 3,245.043 versus 3,170.327 CPU-ms and remains approximately 94–95% merger work, dominated by FST and postings paths. Inclusive categories overlap. Step 127 is not an individual win: publication spans rise from 45.085 to 50.171 ms and CPU rises from 91.539 to 100.896 CPU-ms. That sample stays in the diagnostic report; acceptance uses the complete production repeats.
+
+Production append indexing accounts for most savings, 68.7733 versus 65.6268 seconds. Terminal maintenance plus final query totals 7.86555 versus 7.80490 seconds, only 60.653 ms lower overall; the second-repeat increase remains charged. This supports less trailing cleanup synchronization, not faster Tantivy merging or a quantified physical-I/O saving.
+
+Remaining candidate append cleanup spans total 1.48460 seconds for generation pruning, 0.56659 seconds for shared collection, and 0.01525 seconds for legacy scanning. Ingest, pending-intent, and scan-cache saves remain at 4.24368, 2.63133, and 2.69206 seconds across 260 appends. All are diagnostic elapsed spans, not a disjoint decomposition of production time.
+
+`analysis/{production.json,diagnostic.json,traces.json,attribution.json}` retains the combined accounting. The five CPU pairs have matching `.cpu-us.folded`, `.cpu.json`, and `.cpu.svg` artifacts. Initial, step-127, and terminal PNGs for both variants were rendered at 1600 px and visually inspected. Graph widths use positive Samply thread-CPU deltas, not elapsed occupancy; CPU is not subtracted from wall time to infer I/O wait.
+
+### Validation and limits
+
+Thirteen cleanup-filter tests pass in both candidate modes, including nine new cleanup cases. Tests directly observe synchronization decisions, permission-denied attempts, empty-owner removal with zero file count, dry-run behavior, and error propagation. The permission fixture ran as unprivileged UID 502. All five integration suites pass in each mode: 35 default and 38 profiling-enabled tests. Formatting, Clippy, source review, and independent production-accounting review pass.
+
+The complete default library suite records 735 passes and the unchanged upstream FSEvents assertion failure, which also fails its single exact retry. Profiling passes 737 library tests. Four intentional library ignores remain; no tests are excluded. Imported baseline receipts retain their original FSEvents failures. This does not establish a uniformly green test suite or physical power-loss validation.
+
+Evidence is under `/Users/srnnkls/Library/Caches/memex-cleanup-aggregate-20260909`: `baseline-import.json`, `imported-publication-receipts/`, source manifests/proofs, `artifact-readiness.json`, native build/test receipts, and `harness-readiness.json` identify the experiment. `production/{summary.json,rows.jsonl,calls.jsonl,fingerprints.jsonl,source-restoration.json}` retains complete timing and correctness evidence. The calibrated observer, interruption/mutation guards, and strict CPU classifier are unchanged apart from experiment paths and explicit baseline-import handling.
+
+No installation, live-index mutation, commit, or push occurred. Host load and cache carryover remain uncontrolled. These are separate index/query processes on one corpus, not automatic-search, all-provider discovery, or cold-cache measurements. Do not add percentages or compare per-update figures across separate experiments as a matched result.
+
 ## Publication preparation: 177.28 to 163.63 ms with corrected timing
 
 2026-09-09. Against freshly built rebased `9464029` (0.18.1), publication-preparation batching reduces sustained aggregate elapsed time by 7.70%. Both variants use blocking process waits; the baseline already contains shared segments, incremental tiers, and private staging batching. This comparison isolates publication preparation and does not reuse the installed 0.17.5 executable or earlier polling-based timings.

@@ -343,13 +343,17 @@ fn adopt_file(root: &Path, owner: &str, name: &Path, source: &Path) -> Result<()
         bail!("segment owner must not be a symlink");
     }
     let target = directory.join(checked_name(name)?);
-    if target.try_exists()? {
-        if !fs::symlink_metadata(&target)?.file_type().is_file()
-            || fs::read(&target)? != fs::read(source)?
-        {
-            bail!("immutable segment collision at {}", target.display());
+    // `try_exists` follows links, so a dangling symlink here would look absent and the
+    // copy below would write through it, outside the store. Any existing entry counts.
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() || fs::read(&target)? != fs::read(source)? {
+                bail!("immutable segment collision at {}", target.display());
+            }
+            return Ok(());
         }
-        return Ok(());
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     if fs::hard_link(source, &target).is_err() {
         fs::copy(source, &target)?;
@@ -575,14 +579,37 @@ pub(super) fn index_root(generation: &Path) -> &Path {
 }
 
 pub(super) fn collect_unreachable(root: &Path, dry_run: bool) -> Result<usize> {
+    collect_unreachable_excluding(root, dry_run, &[])
+}
+
+/// `doomed` names generation directories the caller is about to remove. A dry run has not
+/// removed them yet, so without this their manifests would keep their payloads reachable and
+/// the reported count would be far lower than what a real run reclaims.
+pub(super) fn collect_unreachable_excluding(
+    root: &Path,
+    dry_run: bool,
+    doomed: &[PathBuf],
+) -> Result<usize> {
+    collect_unreachable_with_sync(root, dry_run, doomed, sync_directory)
+}
+
+fn collect_unreachable_with_sync(
+    root: &Path,
+    dry_run: bool,
+    doomed: &[PathBuf],
+    synchronize: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<usize> {
+    crate::profiling::span!("lexical.cleanup.shared");
+    crate::profiling::count!("lexical.cleanup.shared.calls", 1);
     let store = root.join(STORE);
     if !store.exists() {
+        crate::profiling::count!("lexical.cleanup.shared.sync_skips", 1);
         return Ok(0);
     }
     let mut reachable = HashSet::new();
     for entry in fs::read_dir(root.join(GENERATIONS_DIR))? {
         let entry = entry?;
-        if !entry.file_type()?.is_dir() {
+        if !entry.file_type()?.is_dir() || doomed.iter().any(|path| *path == entry.path()) {
             continue;
         }
         if let Some(manifest) = Manifest::read(&entry.path())? {
@@ -595,6 +622,7 @@ pub(super) fn collect_unreachable(root: &Path, dry_run: bool) -> Result<usize> {
         }
     }
     let mut removed = 0;
+    let mut removal_attempted = false;
     for owner in fs::read_dir(&store)? {
         let owner = owner?;
         if owner.file_name() == ".lock" {
@@ -612,16 +640,21 @@ pub(super) fn collect_unreachable(root: &Path, dry_run: bool) -> Result<usize> {
             if !reachable.contains(&key) {
                 removed += 1;
                 if !dry_run {
+                    removal_attempted = true;
                     fs::remove_file(entry.path())?;
                 }
             }
         }
         if !dry_run && fs::read_dir(owner.path())?.next().is_none() {
+            removal_attempted = true;
             fs::remove_dir(owner.path())?;
         }
     }
-    if !dry_run {
-        sync_directory(&store)?;
+    if removal_attempted {
+        crate::profiling::count!("lexical.cleanup.shared.sync_requests", 1);
+        synchronize(&store)?;
+    } else {
+        crate::profiling::count!("lexical.cleanup.shared.sync_skips", 1);
     }
     Ok(removed)
 }
@@ -638,6 +671,109 @@ mod tests {
 
     fn bytes(directory: &SharedDirectory, path: &str) -> Vec<u8> {
         directory.atomic_read(Path::new(path)).unwrap()
+    }
+
+    #[test]
+    fn cleanup_shared_empty_owner_syncs_despite_zero_file_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let _guard = lock_store(root).unwrap();
+        fs::create_dir(root.join(GENERATIONS_DIR)).unwrap();
+        let owner = root.join(STORE).join(new_generation_name());
+        fs::create_dir(&owner).unwrap();
+        assert_eq!(
+            collect_unreachable_with_sync(root, true, &[], |_| {
+                panic!("dry run must not synchronize")
+            })
+            .unwrap(),
+            0
+        );
+        assert!(owner.exists());
+        let syncs = std::cell::Cell::new(0);
+        assert_eq!(
+            collect_unreachable_with_sync(root, false, &[], |path| {
+                assert_eq!(path, root.join(STORE));
+                syncs.set(syncs.get() + 1);
+                Ok(())
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(syncs.get(), 1);
+        assert!(!owner.exists());
+        assert_eq!(
+            collect_unreachable_with_sync(root, false, &[], |_| {
+                panic!("unchanged store must not synchronize")
+            })
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn cleanup_shared_dry_run_preserves_files_and_removal_propagates_sync_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let _guard = lock_store(root).unwrap();
+        fs::create_dir(root.join(GENERATIONS_DIR)).unwrap();
+        let owner = root.join(STORE).join(new_generation_name());
+        fs::create_dir(&owner).unwrap();
+        let file = owner.join("orphan.store");
+        fs::write(&file, b"unreachable").unwrap();
+        assert_eq!(
+            collect_unreachable_with_sync(root, true, &[], |_| {
+                panic!("dry run must not synchronize")
+            })
+            .unwrap(),
+            1
+        );
+        assert!(file.exists());
+        let syncs = std::cell::Cell::new(0);
+        let error = collect_unreachable_with_sync(root, false, &[], |path| {
+            assert_eq!(path, root.join(STORE));
+            syncs.set(syncs.get() + 1);
+            Err(io::Error::other("shared sync fault"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "shared sync fault");
+        assert_eq!(syncs.get(), 1);
+        assert!(!owner.exists());
+    }
+
+    #[test]
+    fn cleanup_shared_reachable_files_need_no_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let _guard = lock_store(root).unwrap();
+        let owner = new_generation_name();
+        let directory = stage(root, &owner, None);
+        let file = Path::new("live.store");
+        directory.atomic_write(file, b"reachable").unwrap();
+        directory
+            .prepare_publication(root, &owner, &HashSet::from([file.to_path_buf()]))
+            .unwrap();
+        assert_eq!(
+            collect_unreachable_with_sync(root, false, &[], |_| {
+                panic!("reachable store must not synchronize")
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(bytes(&directory, "live.store"), b"reachable");
+    }
+
+    #[test]
+    fn cleanup_shared_invalid_owner_keeps_error_without_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let _guard = lock_store(root).unwrap();
+        fs::create_dir(root.join(GENERATIONS_DIR)).unwrap();
+        fs::create_dir(root.join(STORE).join("invalid-owner")).unwrap();
+        let error = collect_unreachable_with_sync(root, false, &[], |_| {
+            panic!("invalid inventory must not introduce synchronization")
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "unexpected segment-store entry");
     }
 
     #[test]
