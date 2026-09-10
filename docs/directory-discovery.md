@@ -1,6 +1,6 @@
 # Directory inventory reuse
 
-The directory inventory caches complete immediate child names and types, not file contents or source freshness. TTL-0 requests still reconcile sources without a daemon. Claude and Codex rollout discovery share a request-owned inventory; other discovery paths retain their existing traversal and database checks.
+The directory inventory caches complete immediate child names and types, not file contents or source freshness. TTL-0 requests still reconcile sources without a daemon. Claude, Codex rollout, Pi and Omp discovery share a request-owned inventory; other discovery paths retain their existing traversal and database checks.
 
 Every traversed directory is checked independently. An unchanged ancestor does not certify its descendants. Candidate files still pass through the existing parallel metadata classifier on every request, including ctime-based detection of equal-size rewrites with restored mtime. Directory reuse does not bypass parser, database or WAL checks.
 

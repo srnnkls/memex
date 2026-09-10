@@ -144,8 +144,7 @@ impl ScanCache {
         if data.len() as u64 > Self::MAX_JSON_BYTES {
             return Ok(Self::default());
         }
-        let data = std::str::from_utf8(&data)?;
-        let cache = serde_json::from_str(data).unwrap_or_default();
+        let cache = serde_json::from_slice(&data).unwrap_or_default();
         Ok(cache)
     }
 
@@ -364,6 +363,18 @@ mod tests {
         assert_eq!(cache.last_scan_ts, 0);
         assert_eq!(cache.file_count, 0);
         assert_eq!(cache.total_bytes, 0);
+    }
+
+    #[test]
+    fn optional_scan_cache_invalid_utf8_loads_as_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("scan_cache.json");
+        fs::write(&path, b"\xff").unwrap();
+        let cache = ScanCache::load(&path).expect("invalid optional cache must expire");
+        assert_eq!(cache.last_scan_ts, 0);
+        assert_eq!(cache.file_count, 0);
+        assert_eq!(cache.total_bytes, 0);
+        assert!(cache.directory_inventory.is_none());
     }
 
     #[test]

@@ -426,9 +426,11 @@ impl DiscoveryInventory {
             .as_ref()
             .zip(self.observer.now())
             .is_some_and(|(stamp, now)| stamp.eligible(now));
+        // Sources can share a root, so a listing this same request already verified counts
+        // as well as one loaded from the cache.
         let cached = key
             .as_ref()
-            .and_then(|key| self.previous.get(key))
+            .and_then(|key| self.next.get(key).or_else(|| self.previous.get(key)))
             .filter(|(stamp, _)| eligible && before.as_ref() == Some(stamp))
             .map(|(_, children)| children.clone());
         if let Some(cached) = cached
@@ -791,12 +793,14 @@ mod platform {
         path: &Path,
     ) -> io::Result<Vec<(OsString, EntryType)>> {
         let Some(anchor) = anchor else {
-            return fs::read_dir(path)?
-                .map(|entry| {
-                    let entry = entry?;
-                    Ok((entry.file_name(), EntryType::of(entry.file_type()?)))
-                })
-                .collect();
+            // The no-follow open failed, which is what happens when the entry became a
+            // symlink after it was seen as a directory. Reading it here would follow that
+            // link and enumerate outside the root, so fail and let the caller fall back to
+            // the non-following walker.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("no directory handle for {}", path.display()),
+            ));
         };
         // fdopendir owns the duplicate; the validation handle remains open.
         let descriptor = unsafe { libc::dup(anchor.as_raw_fd()) };
