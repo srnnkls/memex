@@ -23,6 +23,7 @@ The existing ingestion lease is retained across observation and execution. Check
 ## Cost contracts
 
 - An unchanged refresh creates no lexical staging generation, writer, commit, or merge work.
+- Full discovery reuses directory stamps. Each successful refresh records device, inode, and mtime for every directory it enumerated, keyed by a fingerprint of the source roots, provider flags, and exclude patterns. The next full scan stats each stamped directory and reads only those whose stamp moved, taking the files of unchanged directories from the checkpoint. A directory's mtime changes on entry creation, removal, or rename and never on in-place appends, so known files keep their individual stat check. Stamps are written in the same checkpoint transaction as the file rows; a failed refresh persists none.
 - A parsed update with no indexable records advances checkpoints without opening a lexical writer.
 - Metadata enrichment performs no subprocess calls. SQL persistence performs no source or repository discovery.
 - Source-ID presence checks reuse one reader; analytics inventory returns only candidate paths.

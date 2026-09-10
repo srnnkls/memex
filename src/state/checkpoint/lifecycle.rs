@@ -25,6 +25,19 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE INDEX IF NOT EXISTS files_mtime ON files(mtime);
 ";
 
+/// Added after format version 2 shipped; every writer creates it on open so existing
+/// databases gain it without a format bump. Readers treat its absence as no stamps.
+const DIRECTORIES_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS directories (
+    path TEXT PRIMARY KEY NOT NULL,
+    fingerprint TEXT NOT NULL,
+    device INTEGER NOT NULL,
+    inode INTEGER NOT NULL,
+    mtime_secs INTEGER NOT NULL,
+    mtime_nanos INTEGER NOT NULL
+);
+";
+
 pub(super) enum MigrationFailure {
     None,
     #[cfg(test)]
@@ -180,6 +193,7 @@ fn open_connection(state_path: &Path, writable: bool, create: bool) -> Result<Co
 }
 
 fn configure_writer(connection: &Connection) -> Result<()> {
+    connection.execute_batch(DIRECTORIES_SCHEMA)?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
     connection.pragma_update(None, "fullfsync", false)?;

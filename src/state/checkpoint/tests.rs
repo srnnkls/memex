@@ -1504,3 +1504,128 @@ fn optional_scan_cache_oversize_archival_survives_failure_and_retry() {
         assert_eq!(fs::metadata(&archive).unwrap().len(), 80 * 1024 * 1024 + 9);
     }
 }
+
+#[test]
+fn directory_stamps_round_trip_under_their_fingerprint_only() {
+    use crate::ingest::directories::{DirectoryStamp, DirectoryStampUpdate};
+    let (_temp, path, lease) = fixture();
+    let mut writer = CheckpointWriter::open(&path, &lease, true).unwrap();
+    let stamp = DirectoryStamp {
+        device: u64::MAX,
+        inode: 7,
+        mtime_secs: 1_700_000_000,
+        mtime_nanos: 123_456_789,
+    };
+    writer
+        .commit_delta(&CheckpointDelta {
+            directory_stamps: Some(DirectoryStampUpdate {
+                fingerprint: "fp-a".into(),
+                upserts: vec![
+                    (PathBuf::from("/tmp/a"), stamp),
+                    (PathBuf::from("/tmp/b"), stamp),
+                ],
+                deletes: Vec::new(),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    let loaded = writer.reader().load_directory_stamps("fp-a").unwrap();
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(loaded[&PathBuf::from("/tmp/a")], stamp);
+    assert!(
+        writer
+            .reader()
+            .load_directory_stamps("fp-b")
+            .unwrap()
+            .is_empty()
+    );
+    writer
+        .commit_delta(&CheckpointDelta {
+            directory_stamps: Some(DirectoryStampUpdate {
+                fingerprint: "fp-a".into(),
+                upserts: Vec::new(),
+                deletes: vec![PathBuf::from("/tmp/b")],
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        writer.reader().load_directory_stamps("fp-a").unwrap().len(),
+        1
+    );
+    let unchanged = writer
+        .commit_delta(&CheckpointDelta {
+            directory_stamps: Some(DirectoryStampUpdate {
+                fingerprint: "fp-a".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        !unchanged,
+        "an empty stamp update must not open a transaction"
+    );
+    writer
+        .commit_delta(&CheckpointDelta {
+            directory_stamps: Some(DirectoryStampUpdate {
+                fingerprint: "fp-b".into(),
+                upserts: vec![(PathBuf::from("/tmp/c"), stamp)],
+                deletes: Vec::new(),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        writer
+            .reader()
+            .load_directory_stamps("fp-a")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        writer.reader().load_directory_stamps("fp-b").unwrap().len(),
+        1
+    );
+}
+
+#[test]
+fn writers_add_the_directories_table_to_existing_databases() {
+    use crate::ingest::directories::{DirectoryStamp, DirectoryStampUpdate};
+    let (_temp, path, lease) = fixture();
+    let writer = CheckpointWriter::open(&path, &lease, true).unwrap();
+    connection(&writer)
+        .execute_batch("DROP TABLE directories")
+        .unwrap();
+    assert!(
+        writer
+            .reader()
+            .load_directory_stamps("fp")
+            .unwrap()
+            .is_empty()
+    );
+    drop(writer);
+    let mut writer = CheckpointWriter::open(&path, &lease, false).unwrap();
+    writer
+        .commit_delta(&CheckpointDelta {
+            directory_stamps: Some(DirectoryStampUpdate {
+                fingerprint: "fp".into(),
+                upserts: vec![(
+                    PathBuf::from("/tmp/a"),
+                    DirectoryStamp {
+                        device: 1,
+                        inode: 2,
+                        mtime_secs: 3,
+                        mtime_nanos: 4,
+                    },
+                )],
+                deletes: Vec::new(),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        writer.reader().load_directory_stamps("fp").unwrap().len(),
+        1
+    );
+}

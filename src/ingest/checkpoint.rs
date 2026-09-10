@@ -1,6 +1,7 @@
 use super::*;
 use crate::state::OpencodeDatabaseState;
 use crate::state::checkpoint::{CheckpointDelta, CheckpointWriter, PendingChange};
+use std::path::PathBuf;
 
 pub(super) struct CheckpointSession {
     writer: CheckpointWriter,
@@ -12,6 +13,7 @@ pub(super) struct CheckpointSession {
     pub opencode_databases: HashMap<String, OpencodeDatabaseState>,
     pub pending: Option<PendingIngest>,
     pub scan_cache: ScanCache,
+    pub directory_stamps: Option<super::directories::DirectoryStampUpdate>,
 }
 
 impl CheckpointSession {
@@ -36,7 +38,24 @@ impl CheckpointSession {
             opencode_databases: header.opencode_databases,
             pending: header.pending,
             scan_cache: header.scan_cache,
+            directory_stamps: None,
         })
+    }
+
+    /// Paths tracked by the last committed checkpoint, ignoring this session's pending changes.
+    pub fn persisted_file_keys(&self) -> Result<Vec<String>> {
+        self.writer.reader().file_keys()
+    }
+
+    pub fn clears_files(&self) -> bool {
+        self.delta.clear_files
+    }
+
+    pub fn load_directory_stamps(
+        &self,
+        fingerprint: &str,
+    ) -> Result<HashMap<PathBuf, super::directories::DirectoryStamp>> {
+        self.writer.reader().load_directory_stamps(fingerprint)
     }
 
     pub fn preload(&mut self, paths: &[String]) -> Result<()> {
@@ -143,6 +162,7 @@ impl CheckpointSession {
         crate::profiling::span!("state.checkpoint.commit_final");
         self.delta.scan_cache = cache;
         self.delta.pending = pending;
+        self.delta.directory_stamps = self.directory_stamps.take();
         self.delta.next_doc_id =
             (self.next_doc_id != self.original_next_doc_id).then_some(self.next_doc_id);
         self.delta.opencode_databases = (self.opencode_databases
