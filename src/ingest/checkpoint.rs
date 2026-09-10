@@ -14,6 +14,7 @@ pub(super) struct CheckpointSession {
     pub pending: Option<PendingIngest>,
     pub scan_cache: ScanCache,
     pub directory_stamps: Option<super::directories::DirectoryStampUpdate>,
+    pub journal_cursor: Option<super::journal::JournalCursorUpdate>,
 }
 
 impl CheckpointSession {
@@ -39,6 +40,7 @@ impl CheckpointSession {
             pending: header.pending,
             scan_cache: header.scan_cache,
             directory_stamps: None,
+            journal_cursor: None,
         })
     }
 
@@ -56,6 +58,23 @@ impl CheckpointSession {
         fingerprint: &str,
     ) -> Result<HashMap<PathBuf, super::directories::DirectoryStamp>> {
         self.writer.reader().load_directory_stamps(fingerprint)
+    }
+
+    pub fn load_journal_cursor(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<super::journal::JournalCursor>> {
+        self.writer.reader().load_journal_cursor(fingerprint)
+    }
+
+    /// Paths the last committed checkpoint saw modified at or after `since` (Unix seconds).
+    pub fn hot_file_keys(&self, since: i64) -> Result<Vec<String>> {
+        Ok(self
+            .writer
+            .reader()
+            .hot_files_since(since)?
+            .into_keys()
+            .collect())
     }
 
     pub fn preload(&mut self, paths: &[String]) -> Result<()> {
@@ -163,6 +182,7 @@ impl CheckpointSession {
         self.delta.scan_cache = cache;
         self.delta.pending = pending;
         self.delta.directory_stamps = self.directory_stamps.take();
+        self.delta.journal_cursor = self.journal_cursor.take();
         self.delta.next_doc_id =
             (self.next_doc_id != self.original_next_doc_id).then_some(self.next_doc_id);
         self.delta.opencode_databases = (self.opencode_databases

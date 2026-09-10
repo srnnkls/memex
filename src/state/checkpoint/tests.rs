@@ -1629,3 +1629,57 @@ fn writers_add_the_directories_table_to_existing_databases() {
         1
     );
 }
+
+#[test]
+fn the_journal_cursor_round_trips_under_its_fingerprint_and_survives_a_missing_table() {
+    use crate::ingest::journal::{JournalCursor, JournalCursorUpdate};
+    let (_temp, path, lease) = fixture();
+    let writer = CheckpointWriter::open(&path, &lease, true).unwrap();
+    connection(&writer)
+        .execute_batch("DROP TABLE journal")
+        .unwrap();
+    assert_eq!(writer.reader().load_journal_cursor("fp").unwrap(), None);
+    drop(writer);
+    let mut writer = CheckpointWriter::open(&path, &lease, false).unwrap();
+    let cursor = JournalCursor {
+        device_uuid: "vol-1".into(),
+        event_id: u64::MAX - 7,
+    };
+    assert!(
+        writer
+            .commit_delta(&CheckpointDelta {
+                journal_cursor: Some(JournalCursorUpdate {
+                    fingerprint: "fp".into(),
+                    cursor: cursor.clone(),
+                }),
+                ..Default::default()
+            })
+            .unwrap()
+    );
+    assert_eq!(
+        writer.reader().load_journal_cursor("fp").unwrap(),
+        Some(cursor)
+    );
+    assert_eq!(writer.reader().load_journal_cursor("other").unwrap(), None);
+    writer
+        .commit_delta(&CheckpointDelta {
+            journal_cursor: Some(JournalCursorUpdate {
+                fingerprint: "other".into(),
+                cursor: JournalCursor {
+                    device_uuid: "vol-1".into(),
+                    event_id: 9,
+                },
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(writer.reader().load_journal_cursor("fp").unwrap(), None);
+    assert_eq!(
+        writer
+            .reader()
+            .load_journal_cursor("other")
+            .unwrap()
+            .map(|cursor| cursor.event_id),
+        Some(9)
+    );
+}

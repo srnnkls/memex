@@ -214,6 +214,62 @@ fn discovery_fingerprint(options: &IngestOptions) -> String {
     format!("{:x}", hash.finalize())
 }
 
+/// Files whose last committed mtime falls inside this window are stat-checked on every
+/// journal-narrowed refresh. The journal lags the kernel by a few tens of milliseconds, so a
+/// transcript being appended right now may not be in the replay yet.
+pub(super) const JOURNAL_HOT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Replay the file-system event journal since the cursor persisted by the last committed
+/// refresh. Returns the cursor to persist with this refresh and, when the journal was complete,
+/// the paths that may have changed. `None` hints mean the caller must walk.
+fn journal_hints(
+    options: &IngestOptions,
+    state: &CheckpointSession,
+) -> Result<(
+    Option<journal::JournalCursorUpdate>,
+    Option<HashSet<PathBuf>>,
+)> {
+    let roots = crate::watch::watch_roots(options);
+    let fingerprint = journal_fingerprint(options, &roots);
+    let previous = state.load_journal_cursor(&fingerprint)?;
+    let replay = journal::replay(&roots, previous.as_ref(), journal::REPLAY_TIMEOUT);
+    let cursor = replay.next.map(|cursor| journal::JournalCursorUpdate {
+        fingerprint,
+        cursor,
+    });
+    let hints = match replay.outcome {
+        journal::Replay::Changed(mut paths) => {
+            let since = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_sub(JOURNAL_HOT_WINDOW.as_secs()) as i64;
+            paths.extend(state.hot_file_keys(since)?.into_iter().map(PathBuf::from));
+            crate::profiling::count!("journal.hints", paths.len());
+            Some(paths)
+        }
+        journal::Replay::Unusable(_) => {
+            crate::profiling::count!("journal.fallbacks", 1);
+            None
+        }
+    };
+    Ok((cursor, hints))
+}
+
+/// A cursor is only meaningful for the roots that existed when it was captured: a root that
+/// appears later was never watched and needs a walk.
+fn journal_fingerprint(options: &IngestOptions, roots: &[PathBuf]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"memex-journal-v1");
+    hash.update(discovery_fingerprint(options).as_bytes());
+    for root in roots.iter().filter(|root| root.exists()) {
+        let bytes = root.as_os_str().as_encoded_bytes();
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    format!("{:x}", hash.finalize())
+}
+
 pub(super) fn modified_ns(metadata: &std::fs::Metadata) -> Option<i64> {
     metadata
         .modified()
@@ -932,7 +988,32 @@ pub(super) fn prepare_refresh(
     } else {
         None
     };
+    let mut journal_cursor = None;
+    let selected = match selected {
+        None if options.journal
+            && dirty.is_none()
+            && !recovering_pending_ingest
+            && !empty_index_rebuild
+            && state_path.exists()
+            && !state.clears_files() =>
+        {
+            let (cursor, hints) = journal_hints(options, &state)?;
+            journal_cursor = cursor;
+            match hints {
+                Some(hints) => match selection::resolve_dirty(options, &hints, &state)? {
+                    selection::DirtySelection::Paths { files, databases } => {
+                        crate::profiling::count!("journal.narrowed_refreshes", 1);
+                        Some((files, databases))
+                    }
+                    selection::DirtySelection::Resync => None,
+                },
+                None => None,
+            }
+        }
+        selected => selected,
+    };
     let full_scan = selected.is_none();
+    state.journal_cursor = journal_cursor;
 
     // Index-time exclusion: matched transcripts never enter the index, and
     // records previously indexed from now-excluded paths are removed.

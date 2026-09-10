@@ -2690,6 +2690,7 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
         embed_runtime: config.resolve_embed_runtime()?,
         tool_content_limits: config.indexed_tool_content_limits()?,
         defer_merges: stale_only,
+        journal: stale_only,
     };
     if stale_only {
         Ok(
