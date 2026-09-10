@@ -45,6 +45,81 @@ fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
 }
 
 #[test]
+fn torn_jsonl_checkpoint_survives_completion_truncation_and_append() {
+    use std::io::Write;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("claude-projects");
+    let project = root.join("project");
+    fs::create_dir_all(&project).unwrap();
+    let path = project.join("session.jsonl");
+    let prefix = "{\"type\":\"user\",\"message\":{\"content\":\"prefix\"}}\n";
+    let tail = r#"{"type":"user","message":{"content":"completed"}}"#;
+    let mut writer = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writer.write_all(prefix.as_bytes()).unwrap();
+    writer
+        .write_all(&tail.as_bytes()[..tail.len() - 2])
+        .unwrap();
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let mut options = ingest_options(false, ModelChoice::Gemma);
+    options.claude_sources = vec![root];
+    let ingest = || ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+    let saved_state = || {
+        IngestState::load(&paths.state.join("ingest.json"))
+            .unwrap()
+            .files[&path.to_string_lossy().into_owned()]
+            .clone()
+    };
+    let texts = || {
+        let index = open_search_index(&paths);
+        let mut texts = Vec::new();
+        index
+            .for_each_record(|record| {
+                texts.push(record.text.clone());
+                Ok(())
+            })
+            .unwrap();
+        texts.sort();
+        texts
+    };
+    assert_eq!(ingest().records_added, 1);
+    assert_eq!(saved_state().offset, prefix.len() as u64);
+    assert_eq!(texts(), ["prefix"]);
+    assert_eq!(ingest().records_added, 0);
+    writer
+        .write_all(&tail.as_bytes()[tail.len() - 2..])
+        .unwrap();
+    assert_eq!(ingest().records_added, 1);
+    assert_eq!(texts(), ["completed", "prefix"]);
+    assert_eq!(saved_state().offset, path.metadata().unwrap().len());
+
+    let replacement = r#"{"type":"user","message":{"content":"replacement"}}"#;
+    writer.set_len(0).unwrap();
+    writer
+        .write_all(&replacement.as_bytes()[..replacement.len() - 2])
+        .unwrap();
+    assert_eq!(ingest().records_added, 0);
+    assert!(texts().is_empty());
+    assert_eq!(saved_state().offset, 0);
+    assert_eq!(saved_state().turn_id, 0);
+    writer
+        .write_all(&replacement.as_bytes()[replacement.len() - 2..])
+        .unwrap();
+    assert_eq!(ingest().records_added, 1);
+    writer.write_all(format!("\n{tail}\n").as_bytes()).unwrap();
+    assert_eq!(ingest().records_added, 1);
+    assert_eq!(texts(), ["completed", "replacement"]);
+    assert_eq!(saved_state().turn_id, 2);
+    assert_eq!(ingest().records_added, 0);
+}
+
+#[test]
 fn exclusion_filters_new_and_previously_indexed_transcripts() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let claude_root = tmp.path().join("claude-projects");

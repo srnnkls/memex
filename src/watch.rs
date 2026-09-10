@@ -11,11 +11,6 @@
 //! - Events are **hints only**. Dirty fires select affected inputs for the
 //!   normal incremental ingest, whose `IngestState` comparison (`size`/`mtime`/identity) stays
 //!   the source of truth. A spurious event costs one cheap stat check.
-//! - Fires are debounced and settled: a transcript being actively appended to
-//!   must go quiet before it is parsed. This matters because the JSONL
-//!   parsers treat a torn trailing line (no newline yet) as a complete line,
-//!   advance the byte offset past it, and would permanently lose that record
-//!   once the writer completes the line.
 //! - Anything suspicious — watcher errors, [`notify`] rescan flags
 //!   (`mustScanSubDirs`, `IN_Q_OVERFLOW`), a full dirty set, a newly appeared
 //!   watch root — escalates to a full resync ingest, exactly like the old
