@@ -187,10 +187,6 @@ fn ignorable_file_name(name: &str) -> bool {
         || name.ends_with("-shm")
         || name.ends_with("-journal")
         || name.starts_with(".memex-opencode-spool-")
-        || matches!(
-            name,
-            "ingest.json" | "ingest.pending.json" | "scan_cache.json"
-        )
 }
 
 /// Classify one watcher event. Returns the paths worth tracking, and whether

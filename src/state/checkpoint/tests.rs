@@ -575,7 +575,7 @@ fn malformed_marker_missing_database_missing_lock_and_unknown_versions_fail_clos
             "version" => {
                 let raw = fs::read_to_string(&path)
                     .unwrap()
-                    .replace("checkpoints:1:", "checkpoints:99:");
+                    .replace("checkpoints:2:", "checkpoints:99:");
                 fs::write(&path, raw).unwrap();
             }
             "identity" => fs::write(
@@ -720,5 +720,816 @@ fn checkpoint_artifact_names_are_canonical_and_bounded() {
         "session.jsonl",
     ] {
         assert!(!is_checkpoint_artifact_name(OsStr::new(name)));
+    }
+}
+
+fn pending() -> PendingIngest {
+    PendingIngest {
+        next_doc_id: 19,
+        source_paths: vec!["source".into()],
+        session_scopes: vec![super::super::SessionScope {
+            source_path: "source".into(),
+            session_id: "session".into(),
+        }],
+        vector_publication: true,
+    }
+}
+
+fn cache() -> ScanCache {
+    ScanCache {
+        last_scan_ts: 17,
+        file_count: 3,
+        total_bytes: u64::MAX,
+        directory_inventory: None,
+    }
+}
+
+fn extended_sidecars(path: &Path) -> (Value, Value) {
+    let mut pending = serde_json::to_value(pending()).unwrap();
+    pending["extension"] = serde_json::json!({"future":u64::MAX});
+    pending["session_scopes"][0]["extension"] = serde_json::json!({"owner":"session"});
+    let mut cache = serde_json::to_value(cache()).unwrap();
+    cache["extension"] = serde_json::json!([u64::MAX, "cache"]);
+    cache["directory_inventory"] = serde_json::json!({
+        "version": 1,
+        "projection": [1, 2, 3],
+        "epoch": {"boot": vec![0; 32], "mounts": 1},
+        "observed": {"seconds": 1, "nanos": 1},
+        "directories": [],
+        "children": []
+    });
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for (name, value) in [(PENDING, &pending), (SCAN_CACHE, &cache)] {
+        fs::write(
+            path.with_file_name(name),
+            serde_json::to_vec_pretty(value).unwrap(),
+        )
+        .unwrap();
+    }
+    (pending, cache)
+}
+
+fn v1_fixture(path: &Path) -> Value {
+    let original = extended_legacy(path);
+    let identity = "a".repeat(64);
+    fs::write(path.with_file_name(LOCK), "").unwrap();
+    let connection = Connection::open(path.with_file_name(DATABASE)).unwrap();
+    connection.execute_batch("
+        PRAGMA journal_mode=WAL;
+        CREATE TABLE metadata (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            format_version INTEGER NOT NULL,
+            store_id TEXT NOT NULL,
+            origin TEXT NOT NULL,
+            next_doc_id TEXT NOT NULL CHECK(typeof(next_doc_id)='text'),
+            opencode_databases TEXT NOT NULL CHECK(json_valid(opencode_databases) AND json_type(opencode_databases)='object'),
+            legacy_extras TEXT NOT NULL CHECK(json_valid(legacy_extras) AND json_type(legacy_extras)='object')
+        );
+        CREATE TABLE files (
+            path TEXT PRIMARY KEY NOT NULL,
+            payload TEXT NOT NULL CHECK(json_valid(payload) AND json_type(payload)='object'),
+            mtime INTEGER GENERATED ALWAYS AS (json_extract(payload,'$.mtime')) STORED NOT NULL
+                CHECK(json_type(payload,'$.mtime')='integer' AND typeof(mtime)='integer')
+        );
+        CREATE INDEX files_mtime ON files(mtime);
+    ").unwrap();
+    connection
+        .execute(
+            "INSERT INTO metadata VALUES(1,1,?1,'legacy:fixture',?2,?3,?4)",
+            params![
+                identity,
+                u64::MAX.to_string(),
+                serde_json::to_string(&original["opencode_databases"]).unwrap(),
+                codec::legacy_extras(&original).unwrap()
+            ],
+        )
+        .unwrap();
+    for (key, value) in original["files"].as_object().unwrap() {
+        connection
+            .execute(
+                "INSERT INTO files(path,payload) VALUES(?1,?2)",
+                params![key, serde_json::to_string(value).unwrap()],
+            )
+            .unwrap();
+    }
+    lifecycle::checkpoint(&connection).unwrap();
+    fs::write(
+        path,
+        serde_json::to_vec(&format!("{MARKER_PREFIX}1:{identity}")).unwrap(),
+    )
+    .unwrap();
+    original
+}
+
+#[test]
+fn direct_legacy_and_v1_upgrade_import_all_documents_and_archive_raw_sidecars() {
+    use sha2::{Digest, Sha256};
+    for v1 in [false, true] {
+        let (_temp, path, lease) = fixture();
+        let original = if v1 {
+            v1_fixture(&path)
+        } else {
+            extended_legacy(&path)
+        };
+        let (pending, cache) = extended_sidecars(&path);
+        let raw: Vec<_> = [PENDING, SCAN_CACHE]
+            .iter()
+            .map(|name| (*name, fs::read(path.with_file_name(name)).unwrap()))
+            .collect();
+        let reader = CheckpointReader::open(&path).unwrap();
+        assert_eq!(reader.export_pending_json().unwrap(), Some(pending.clone()));
+        assert_eq!(
+            reader.export_scan_cache_json().unwrap(),
+            Some(cache.clone())
+        );
+        assert_eq!(
+            reader.header().unwrap().pending,
+            Some(serde_json::from_value(pending.clone()).unwrap())
+        );
+        assert!(
+            reader
+                .header()
+                .unwrap()
+                .scan_cache
+                .directory_inventory
+                .is_some()
+        );
+        drop(reader);
+        let writer = CheckpointWriter::open(&path, &lease, false).unwrap();
+        assert!(
+            writer
+                .reader()
+                .header()
+                .unwrap()
+                .scan_cache
+                .directory_inventory
+                .is_some()
+        );
+        assert_eq!(writer.reader().export_json().unwrap(), original);
+        assert_eq!(
+            writer.reader().export_pending_json().unwrap(),
+            Some(pending)
+        );
+        assert_eq!(
+            writer.reader().export_scan_cache_json().unwrap(),
+            Some(cache)
+        );
+        assert_eq!(
+            connection(&writer)
+                .query_row("SELECT format_version FROM metadata", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        for (name, raw) in raw {
+            assert!(!path.with_file_name(name).exists());
+            let archive = path.with_file_name(format!(
+                "{}.legacy-{:x}.json",
+                name.trim_end_matches(".json"),
+                Sha256::digest(&raw)
+            ));
+            assert_eq!(fs::read(archive).unwrap(), raw);
+        }
+    }
+}
+
+#[test]
+fn v1_upgrade_failure_boundaries_preserve_one_authority_and_resume_without_stale_import() {
+    for point in [
+        "before_sidecar_backup",
+        "after_pending_backup",
+        "after_cache_backup",
+        "after_sidecar_backup",
+        "before_import",
+        "before_import_commit",
+        "after_import_commit",
+        "before_checkpoint",
+        "after_checkpoint",
+        "before_database_sync",
+        "after_database_file_sync",
+        "after_database_sync",
+        "before_marker",
+        "after_marker",
+        "before_cleanup",
+        "after_pending_cleanup",
+        "after_cache_cleanup",
+        "after_cleanup",
+    ] {
+        let (_temp, path, lease) = fixture();
+        let original = v1_fixture(&path);
+        let (pending, cache) = extended_sidecars(&path);
+        assert!(
+            lifecycle::open_writer(&path, &lease, false, lifecycle::MigrationFailure::At(point))
+                .is_err(),
+            "{point}"
+        );
+        let reader = CheckpointReader::open(&path).unwrap();
+        assert_eq!(reader.export_json().unwrap(), original, "{point}");
+        assert_eq!(
+            reader.export_pending_json().unwrap(),
+            Some(pending.clone()),
+            "{point}"
+        );
+        assert_eq!(
+            reader.export_scan_cache_json().unwrap(),
+            Some(cache.clone()),
+            "{point}"
+        );
+        let upgraded = reader.is_v2();
+        drop(reader);
+        if upgraded {
+            fs::write(path.with_file_name(PENDING), "stale invalid intent").unwrap();
+            fs::write(path.with_file_name(SCAN_CACHE), "stale invalid cache").unwrap();
+        }
+        let writer = CheckpointWriter::open(&path, &lease, false).unwrap();
+        assert_eq!(writer.reader().export_json().unwrap(), original, "{point}");
+        assert_eq!(
+            writer.reader().export_pending_json().unwrap(),
+            Some(pending),
+            "{point}"
+        );
+        assert_eq!(
+            writer.reader().export_scan_cache_json().unwrap(),
+            Some(cache),
+            "{point}"
+        );
+        assert!(!path.with_file_name(PENDING).exists(), "{point}");
+        assert!(!path.with_file_name(SCAN_CACHE).exists(), "{point}");
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("checkpoints:2:")
+        );
+    }
+}
+
+#[test]
+fn db2_marker1_reader_is_read_only_and_writer_finishes_activation() {
+    let (_temp, path, lease) = fixture();
+    let original = v1_fixture(&path);
+    let (pending, cache) = extended_sidecars(&path);
+    assert!(
+        lifecycle::open_writer(
+            &path,
+            &lease,
+            false,
+            lifecycle::MigrationFailure::At("after_import_commit")
+        )
+        .is_err()
+    );
+    let marker = fs::read(&path).unwrap();
+    let database = fs::read(path.with_file_name(DATABASE)).unwrap();
+    fs::write(path.with_file_name(PENDING), "stale").unwrap();
+    fs::write(path.with_file_name(SCAN_CACHE), "stale").unwrap();
+    let reader = CheckpointReader::open(&path).unwrap();
+    assert_eq!(reader.export_json().unwrap(), original);
+    assert_eq!(reader.export_pending_json().unwrap(), Some(pending.clone()));
+    assert_eq!(
+        reader.export_scan_cache_json().unwrap(),
+        Some(cache.clone())
+    );
+    assert_eq!(
+        reader.header().unwrap().pending,
+        Some(serde_json::from_value(pending.clone()).unwrap())
+    );
+    assert_eq!(
+        PendingIngest::load(&path.with_file_name(PENDING)).unwrap(),
+        reader.header().unwrap().pending
+    );
+    assert_eq!(
+        ScanCache::load(&path.with_file_name(SCAN_CACHE))
+            .unwrap()
+            .last_scan_ts,
+        17
+    );
+    drop(reader);
+    assert_eq!(fs::read(&path).unwrap(), marker);
+    assert_eq!(fs::read(path.with_file_name(DATABASE)).unwrap(), database);
+    let writer = CheckpointWriter::open(&path, &lease, false).unwrap();
+    assert_eq!(
+        writer.reader().export_pending_json().unwrap(),
+        Some(pending)
+    );
+    assert_eq!(
+        writer.reader().export_scan_cache_json().unwrap(),
+        Some(cache)
+    );
+}
+
+#[test]
+fn marker2_db1_is_fatal_without_mutating_the_database() {
+    let (_temp, path, lease) = fixture();
+    v1_fixture(&path);
+    let marker = fs::read_to_string(&path)
+        .unwrap()
+        .replace("checkpoints:1:", "checkpoints:2:");
+    fs::write(&path, marker).unwrap();
+    let before = fs::read(path.with_file_name(DATABASE)).unwrap();
+    assert!(CheckpointReader::open(&path).is_err());
+    assert!(CheckpointWriter::open(&path, &lease, false).is_err());
+    assert!(PendingIngest::load(&path.with_file_name(PENDING)).is_err());
+    assert!(ScanCache::load(&path.with_file_name(SCAN_CACHE)).is_err());
+    assert_eq!(fs::read(path.with_file_name(DATABASE)).unwrap(), before);
+}
+
+#[test]
+fn pending_is_strict_but_cache_is_lenient_before_and_after_upgrade() {
+    for v1 in [false, true] {
+        let (_temp, path, lease) = fixture();
+        if v1 {
+            v1_fixture(&path);
+        } else {
+            extended_legacy(&path);
+        }
+        fs::write(path.with_file_name(PENDING), "{broken").unwrap();
+        fs::write(path.with_file_name(SCAN_CACHE), "{broken").unwrap();
+        assert!(CheckpointReader::open(&path).unwrap().header().is_err());
+        assert!(PendingIngest::load(&path.with_file_name(PENDING)).is_err());
+        assert_eq!(
+            ScanCache::load(&path.with_file_name(SCAN_CACHE))
+                .unwrap()
+                .last_scan_ts,
+            0
+        );
+        assert!(CheckpointWriter::open(&path, &lease, false).is_err());
+        pending().save(&path.with_file_name(PENDING)).unwrap();
+        let writer = CheckpointWriter::open(&path, &lease, false).unwrap();
+        assert_eq!(writer.reader().header().unwrap().scan_cache.last_scan_ts, 0);
+        connection(&writer)
+            .execute(
+                "UPDATE metadata SET scancache_json=?1",
+                [r#"{"last_scan_ts":"invalid","extension":7}"#],
+            )
+            .unwrap();
+        assert_eq!(
+            CheckpointReader::open(&path)
+                .unwrap()
+                .header()
+                .unwrap()
+                .scan_cache
+                .last_scan_ts,
+            0
+        );
+        connection(&writer)
+            .execute("UPDATE metadata SET pending_json='{}'", [])
+            .unwrap();
+        assert!(CheckpointReader::open(&path).is_err());
+        assert!(PendingIngest::load(&path.with_file_name(PENDING)).is_err());
+    }
+}
+
+#[test]
+fn early_intent_transaction_does_not_flush_staged_delta_and_failed_final_rolls_back_every_field() {
+    let (_temp, path, lease) = fixture();
+    extended_legacy(&path);
+    extended_sidecars(&path);
+    let mut writer = CheckpointWriter::open(&path, &lease, false).unwrap();
+    let before = writer.reader().export_json().unwrap();
+    let before_cache = writer.reader().export_scan_cache_json().unwrap();
+    let final_delta = CheckpointDelta {
+        clear_files: true,
+        upserts: HashMap::from([("new".into(), file(90))]),
+        next_doc_id: Some(80),
+        opencode_databases: Some(HashMap::new()),
+        pending: PendingChange::Clear,
+        scan_cache: Some(cache()),
+        ..Default::default()
+    };
+    let mut intent = pending();
+    intent.next_doc_id = 80;
+    writer.commit_intent(&intent).unwrap();
+    assert_eq!(writer.reader().export_json().unwrap(), before);
+    assert_eq!(
+        writer.reader().export_scan_cache_json().unwrap(),
+        before_cache
+    );
+    assert_eq!(
+        writer.reader().header().unwrap().pending,
+        Some(intent.clone())
+    );
+    connection(&writer).execute_batch("CREATE TEMP TRIGGER fail_final BEFORE UPDATE OF scancache_json ON metadata BEGIN SELECT RAISE(ABORT, 'final failure'); END;").unwrap();
+    assert!(writer.commit_delta(&final_delta).is_err());
+    assert_eq!(writer.reader().export_json().unwrap(), before);
+    assert_eq!(
+        writer.reader().export_scan_cache_json().unwrap(),
+        before_cache
+    );
+    assert_eq!(writer.reader().header().unwrap().pending, Some(intent));
+    connection(&writer)
+        .execute_batch("DROP TRIGGER fail_final;")
+        .unwrap();
+    assert!(writer.commit_delta(&final_delta).unwrap());
+    assert_eq!(writer.reader().header().unwrap().pending, None);
+    assert_eq!(writer.reader().header().unwrap().next_doc_id, 80);
+    assert_eq!(writer.reader().file_keys().unwrap(), ["new"]);
+    assert!(
+        writer
+            .reader()
+            .header()
+            .unwrap()
+            .opencode_databases
+            .is_empty()
+    );
+}
+
+#[test]
+fn vector_only_clear_cache_only_and_early_failure_are_independent_transactions() {
+    let (_temp, path, lease) = fixture();
+    let mut writer = CheckpointWriter::open(&path, &lease, true).unwrap();
+    let before = writer.reader().export_json().unwrap();
+    let mut intent = pending();
+    intent.source_paths.clear();
+    intent.session_scopes.clear();
+    writer.commit_intent(&intent).unwrap();
+    connection(&writer).execute_batch("CREATE TEMP TRIGGER fail_intent BEFORE UPDATE OF pending_json ON metadata BEGIN SELECT RAISE(ABORT, 'intent failure'); END;").unwrap();
+    assert!(writer.commit_intent(&pending()).is_err());
+    assert_eq!(writer.reader().header().unwrap().pending, Some(intent));
+    connection(&writer)
+        .execute_batch("DROP TRIGGER fail_intent;")
+        .unwrap();
+    assert!(
+        writer
+            .commit_delta(&CheckpointDelta {
+                pending: PendingChange::Clear,
+                ..Default::default()
+            })
+            .unwrap()
+    );
+    assert_eq!(writer.reader().header().unwrap().pending, None);
+    assert!(
+        writer
+            .commit_delta(&CheckpointDelta {
+                scan_cache: Some(cache()),
+                ..Default::default()
+            })
+            .unwrap()
+    );
+    assert_eq!(
+        writer.reader().header().unwrap().scan_cache.last_scan_ts,
+        17
+    );
+    assert_eq!(writer.reader().export_json().unwrap(), before);
+    assert!(!writer.commit_delta(&CheckpointDelta::default()).unwrap());
+}
+
+#[test]
+fn reordered_pending_scopes_keep_extensions_by_identity_and_cache_updates_keep_unknown_fields() {
+    let (_temp, path, lease) = fixture();
+    extended_legacy(&path);
+    let (mut original_pending, original_cache) = extended_sidecars(&path);
+    original_pending["session_scopes"].as_array_mut().unwrap().push(serde_json::json!({"source_path":"another","session_id":"session","extension":"second"}));
+    fs::write(
+        path.with_file_name(PENDING),
+        serde_json::to_vec(&original_pending).unwrap(),
+    )
+    .unwrap();
+    let mut writer = CheckpointWriter::open(&path, &lease, false).unwrap();
+    let mut intent = writer.reader().header().unwrap().pending.unwrap();
+    intent.session_scopes.reverse();
+    writer.commit_intent(&intent).unwrap();
+    let exported = writer.reader().export_pending_json().unwrap().unwrap();
+    assert_eq!(exported["extension"], original_pending["extension"]);
+    assert_eq!(exported["session_scopes"][0]["extension"], "second");
+    assert_eq!(
+        exported["session_scopes"][1]["extension"],
+        original_pending["session_scopes"][0]["extension"]
+    );
+    intent.session_scopes.remove(0);
+    writer
+        .commit_delta(&CheckpointDelta {
+            pending: PendingChange::Replace(intent),
+            scan_cache: Some(ScanCache::default()),
+            ..Default::default()
+        })
+        .unwrap();
+    let exported = writer.reader().export_pending_json().unwrap().unwrap();
+    assert_eq!(exported["session_scopes"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        exported["session_scopes"][0]["extension"],
+        original_pending["session_scopes"][0]["extension"]
+    );
+    assert_eq!(
+        writer.reader().export_scan_cache_json().unwrap().unwrap()["extension"],
+        original_cache["extension"]
+    );
+    assert_eq!(
+        writer.reader().export_scan_cache_json().unwrap().unwrap()["directory_inventory"],
+        Value::Null
+    );
+}
+
+#[test]
+fn lease_aware_sidecar_adapters_route_v2_while_unleased_setters_refuse() {
+    let (_temp, path, lease) = fixture();
+    v1_fixture(&path);
+    let pending_path = path.with_file_name(PENDING);
+    let cache_path = path.with_file_name(SCAN_CACHE);
+    pending().save(&pending_path).unwrap();
+    cache().save(&cache_path).unwrap();
+    assert!(pending_path.exists());
+    drop(CheckpointWriter::open(&path, &lease, false).unwrap());
+    assert!(pending().save(&pending_path).is_err());
+    assert!(PendingIngest::clear(&pending_path).is_err());
+    assert!(cache().save(&cache_path).is_err());
+    PendingIngest::clear_with_lease(&pending_path, &lease).unwrap();
+    assert_eq!(PendingIngest::load(&pending_path).unwrap(), None);
+    pending().save_with_lease(&pending_path, &lease).unwrap();
+    ScanCache::default()
+        .save_with_lease(&cache_path, &lease)
+        .unwrap();
+    assert_eq!(PendingIngest::load(&pending_path).unwrap(), Some(pending()));
+    assert_eq!(ScanCache::load(&cache_path).unwrap().last_scan_ts, 0);
+    assert!(!pending_path.exists());
+    assert!(!cache_path.exists());
+}
+
+#[test]
+fn unexplained_bootstrap_pending_or_cache_cannot_be_reinitialized() {
+    for column in ["pending_json", "scancache_json"] {
+        let (_temp, path, lease) = fixture();
+        assert!(
+            lifecycle::open_writer(
+                &path,
+                &lease,
+                true,
+                lifecycle::MigrationFailure::At("after_import_commit")
+            )
+            .is_err()
+        );
+        let connection = Connection::open(path.with_file_name(DATABASE)).unwrap();
+        let payload = if column == "pending_json" {
+            serde_json::to_string(&pending()).unwrap()
+        } else {
+            "{}".into()
+        };
+        connection
+            .execute(&format!("UPDATE metadata SET {column}=?1"), [payload])
+            .unwrap();
+        drop(connection);
+        assert!(CheckpointReader::open(&path).is_err());
+        assert!(CheckpointWriter::open(&path, &lease, true).is_err());
+    }
+}
+
+#[test]
+fn reset_removes_active_sidecars_but_keeps_all_archives_and_lock_inode() {
+    let (_temp, path, lease) = fixture();
+    extended_legacy(&path);
+    extended_sidecars(&path);
+    drop(CheckpointWriter::open(&path, &lease, false).unwrap());
+    extended_sidecars(&path);
+    let archives: Vec<_> = fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".legacy-"))
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(archives.len(), 3);
+    for archive in &archives {
+        assert!(is_checkpoint_artifact_name(archive.file_name().unwrap()));
+    }
+    assert!(is_checkpoint_artifact_name(OsStr::new(PENDING)));
+    assert!(is_checkpoint_artifact_name(OsStr::new(SCAN_CACHE)));
+    reset(&path, &lease).unwrap();
+    for name in ACTIVE_ARTIFACTS {
+        assert!(!path.with_file_name(name).exists());
+    }
+    for archive in archives {
+        assert!(archive.exists());
+    }
+    assert!(path.with_file_name(LOCK).exists());
+}
+
+#[test]
+fn marker_backed_mutations_never_recreate_a_missing_lifecycle_lock() {
+    for mode in ["v1", "transition", "v2-stale"] {
+        let (_temp, path, lease) = fixture();
+        let original = v1_fixture(&path);
+        let (original_pending, original_cache) = extended_sidecars(&path);
+        match mode {
+            "transition" => assert!(
+                lifecycle::open_writer(
+                    &path,
+                    &lease,
+                    false,
+                    lifecycle::MigrationFailure::At("after_import_commit"),
+                )
+                .is_err()
+            ),
+            "v2-stale" => {
+                drop(CheckpointWriter::open(&path, &lease, false).unwrap());
+                extended_sidecars(&path);
+            }
+            _ => {}
+        }
+        let held_reader = CheckpointReader::open(&path).unwrap();
+        assert_eq!(held_reader.export_json().unwrap(), original);
+        assert_eq!(
+            held_reader.export_pending_json().unwrap(),
+            Some(original_pending.clone())
+        );
+        assert_eq!(
+            held_reader.export_scan_cache_json().unwrap(),
+            Some(original_cache.clone())
+        );
+        let lock_path = path.with_file_name(LOCK);
+        fs::remove_file(&lock_path).unwrap();
+        let snapshot = || -> HashMap<PathBuf, Vec<u8>> {
+            fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    let raw = fs::read(&path).unwrap();
+                    (path, raw)
+                })
+                .collect()
+        };
+        let before = snapshot();
+        let pending_path = path.with_file_name(PENDING);
+        let cache_path = path.with_file_name(SCAN_CACHE);
+        for operation in [
+            "writer",
+            "pending-save",
+            "pending-clear",
+            "cache-save",
+            "leased-pending-save",
+            "leased-pending-clear",
+            "leased-cache-save",
+            "legacy-save",
+            "reset",
+        ] {
+            let result = match operation {
+                "writer" => CheckpointWriter::open(&path, &lease, false).map(drop),
+                "pending-save" => pending().save(&pending_path),
+                "pending-clear" => PendingIngest::clear(&pending_path),
+                "cache-save" => cache().save(&cache_path),
+                "leased-pending-save" => pending().save_with_lease(&pending_path, &lease),
+                "leased-pending-clear" => PendingIngest::clear_with_lease(&pending_path, &lease),
+                "leased-cache-save" => cache().save_with_lease(&cache_path, &lease),
+                "legacy-save" => IngestState::default().save(&path),
+                "reset" => reset(&path, &lease),
+                _ => unreachable!(),
+            };
+            assert!(result.is_err(), "{mode}: {operation}");
+            assert!(!lock_path.exists(), "{mode}: {operation} recreated lock");
+            assert_eq!(
+                snapshot(),
+                before,
+                "{mode}: {operation} mutated checkpoint artifacts"
+            );
+        }
+        assert_eq!(held_reader.export_json().unwrap(), original);
+        assert_eq!(
+            held_reader.export_pending_json().unwrap(),
+            Some(original_pending)
+        );
+        assert_eq!(
+            held_reader.export_scan_cache_json().unwrap(),
+            Some(original_cache)
+        );
+    }
+}
+
+#[test]
+fn missing_authority_cannot_recreate_a_lost_database_bootstrap_lock() {
+    let (_temp, path, lease) = fixture();
+    assert!(
+        lifecycle::open_writer(
+            &path,
+            &lease,
+            true,
+            lifecycle::MigrationFailure::At("after_import_commit"),
+        )
+        .is_err()
+    );
+    let lock_path = path.with_file_name(LOCK);
+    let held_lock = File::open(&lock_path).unwrap();
+    held_lock.try_lock_shared().unwrap();
+    fs::remove_file(&lock_path).unwrap();
+    let snapshot = || -> HashMap<PathBuf, Vec<u8>> {
+        fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let raw = fs::read(&path).unwrap();
+                (path, raw)
+            })
+            .collect()
+    };
+    let before = snapshot();
+    assert!(CheckpointWriter::open(&path, &lease, true).is_err());
+    assert!(!lock_path.exists());
+    assert_eq!(snapshot(), before);
+    assert!(pending().save(&path.with_file_name(PENDING)).is_err());
+    assert!(PendingIngest::clear(&path.with_file_name(PENDING)).is_err());
+    assert!(cache().save(&path.with_file_name(SCAN_CACHE)).is_err());
+    assert!(
+        pending()
+            .save_with_lease(&path.with_file_name(PENDING), &lease)
+            .is_err()
+    );
+    assert!(PendingIngest::clear_with_lease(&path.with_file_name(PENDING), &lease).is_err());
+    assert!(
+        cache()
+            .save_with_lease(&path.with_file_name(SCAN_CACHE), &lease)
+            .is_err()
+    );
+    assert!(IngestState::default().save(&path).is_err());
+    assert!(reset(&path, &lease).is_err());
+    assert!(!lock_path.exists());
+    assert_eq!(snapshot(), before);
+}
+
+#[test]
+fn optional_scan_cache_oversize_does_not_block_checkpoint_open() {
+    let (_temp, path, lease) = fixture();
+    drop(CheckpointWriter::open(&path, &lease, true).unwrap());
+    let database = Connection::open(path.with_file_name(DATABASE)).unwrap();
+    database.execute(
+        r#"UPDATE metadata SET next_doc_id='19', scancache_json='{"padding":"' || printf('%.*c', ?1, 'x') || CAST(x'ff' AS TEXT) || '"}'"#,
+        [80 * 1024 * 1024],
+    ).unwrap();
+    drop(database);
+    let reader = CheckpointReader::open(&path).expect("oversize optional cache must expire");
+    let header = reader.header().unwrap();
+    assert_eq!(header.next_doc_id, 19);
+    assert_eq!(header.scan_cache.last_scan_ts, 0);
+    assert!(header.scan_cache.directory_inventory.is_none());
+    assert_eq!(reader.export_scan_cache_json().unwrap(), None);
+    assert_eq!(
+        ScanCache::load(&path.with_file_name(SCAN_CACHE))
+            .unwrap()
+            .last_scan_ts,
+        0
+    );
+}
+
+#[test]
+fn optional_scan_cache_oversize_archival_survives_failure_and_retry() {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    for v1 in [false, true] {
+        let (_temp, path, lease) = fixture();
+        if v1 {
+            v1_fixture(&path);
+        } else {
+            extended_legacy(&path);
+        }
+        let cache_path = path.with_file_name(SCAN_CACHE);
+        let mut source = File::create(&cache_path).unwrap();
+        let block = [b'x'; 64 * 1024];
+        let mut digest = Sha256::new();
+        for _ in 0..1280 {
+            source.write_all(&block).unwrap();
+            digest.update(block);
+        }
+        source.write_all(b"last byte").unwrap();
+        digest.update(b"last byte");
+        drop(source);
+        let digest = digest.finalize();
+        let archive = path.with_file_name(format!("scan_cache.legacy-{digest:x}.json"));
+        let marker = fs::read(&path).unwrap();
+        assert!(
+            lifecycle::open_writer(
+                &path,
+                &lease,
+                false,
+                lifecycle::MigrationFailure::At("after_cache_backup")
+            )
+            .is_err()
+        );
+        assert!(
+            archive.exists(),
+            "oversize cache must be archived before activation"
+        );
+        assert_eq!(fs::read(&path).unwrap(), marker);
+        assert!(cache_path.exists());
+        let mut archived = File::open(&archive).unwrap();
+        let mut observed = Sha256::new();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let len = archived.read(&mut buffer).unwrap();
+            if len == 0 {
+                break;
+            }
+            observed.update(&buffer[..len]);
+        }
+        assert_eq!(observed.finalize(), digest);
+        drop(archived);
+        OpenOptions::new()
+            .write(true)
+            .open(&archive)
+            .unwrap()
+            .write_all(b"wrong")
+            .unwrap();
+        assert!(CheckpointWriter::open(&path, &lease, false).is_err());
+        assert_eq!(fs::read(&path).unwrap(), marker);
+        assert!(cache_path.exists());
+        fs::copy(&cache_path, &archive).unwrap();
+        let writer = CheckpointWriter::open(&path, &lease, false).unwrap();
+        assert_eq!(writer.reader().header().unwrap().scan_cache.last_scan_ts, 0);
+        assert_eq!(writer.reader().export_scan_cache_json().unwrap(), None);
+        assert!(!cache_path.exists());
+        assert_eq!(fs::metadata(&archive).unwrap().len(), 80 * 1024 * 1024 + 9);
     }
 }

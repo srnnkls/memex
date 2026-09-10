@@ -2236,8 +2236,6 @@ fn reset_reindex_artifacts(paths: &Paths, lease: &IngestLease) -> Result<()> {
     remove_generated_path(&paths.root.join("memory"))?;
 
     for name in [
-        "ingest.pending.json",
-        "scan_cache.json",
         "analytics.sqlite",
         "analytics.sqlite-wal",
         "analytics.sqlite-shm",

@@ -15,6 +15,7 @@ use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::SearchIndex;
 use crate::lease::IngestLease;
 use crate::progress::{Progress, SOURCE_COUNT};
+use crate::state::checkpoint::{CheckpointHeader, CheckpointReader, PendingChange};
 use crate::state::{
     FileIdentity, FileState, PendingIngest, PendingToolCall, ScanCache, SessionScope,
 };
@@ -189,10 +190,8 @@ pub fn ingest_if_stale(
     lease: &IngestLease,
 ) -> Result<Option<IngestReport>> {
     crate::profiling::span!("ingest.freshness");
-    let cache_path = paths.state.join("scan_cache.json");
-    let cache = ScanCache::load(&cache_path)?;
-
-    if can_skip_fresh_scan(&cache, paths, index, options, ttl_seconds)? {
+    let header = CheckpointReader::open(&paths.state.join("ingest.json"))?.header()?;
+    if can_skip_fresh_scan(&header, paths, index, options, ttl_seconds)? {
         crate::profiling::count!("ingest.fresh_cache_hits", 1);
         // The transcript scan cache cannot detect edits in a Markdown memory
         // file. Refresh these small documents even when transcript discovery is
@@ -206,7 +205,7 @@ pub fn ingest_if_stale(
     }
 
     crate::profiling::count!("ingest.fresh_cache_misses", 1);
-    let report = ingest_selected(paths, index, options, lease, None, Some(cache))?.report;
+    let report = ingest_selected(paths, index, options, lease, None, Some(header))?.report;
     Ok(Some(report))
 }
 
@@ -235,14 +234,14 @@ fn ingest_selected(
     options: &IngestOptions,
     lease: &IngestLease,
     dirty: Option<&HashSet<PathBuf>>,
-    scan_cache: Option<ScanCache>,
+    checkpoint_header: Option<CheckpointHeader>,
 ) -> Result<DirtyIngestReport> {
     crate::profiling::span!("ingest.all");
     let repositories = Arc::new(crate::repository::RepositoryResolver::default());
     let pool = parser_thread_pool()?;
-    let recovered = publication::recover_checkpoint(paths, index, lease)?;
+    let recovered = publication::recover_checkpoint(paths, index, lease, checkpoint_header)?;
     let prepared =
-        discovery::prepare_refresh(paths, index, options, &pool, recovered, dirty, scan_cache)?;
+        discovery::prepare_refresh(paths, index, options, &pool, recovered, dirty, None)?;
     let full_scan = prepared.full_scan;
     if full_scan {
         refresh_memories(paths, options, &repositories)?;

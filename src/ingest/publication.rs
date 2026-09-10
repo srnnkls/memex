@@ -281,23 +281,21 @@ pub(super) fn pending_ingest_path(paths: &Paths) -> PathBuf {
     paths.state.join("ingest.pending.json")
 }
 
-pub(super) fn finalize_pending_ingest(
-    pending_path: &Path,
+pub(super) fn finalized_pending_ingest(
     deferred_scopes: &[SessionScope],
     next_doc_id: u64,
-) -> Result<()> {
+) -> PendingChange {
     if deferred_scopes.is_empty() {
-        return PendingIngest::clear(pending_path);
+        return PendingChange::Clear;
     }
-    PendingIngest {
+    PendingChange::Replace(PendingIngest {
         next_doc_id,
         source_paths: Vec::new(),
         vector_delete_paths: Vec::new(),
-        session_scopes: deferred_scopes.to_vec(),
+        session_scopes: pending_scope_union(&[], deferred_scopes),
         vector_publication: false,
         embedding_publication: Some(false),
-    }
-    .save(pending_path)
+    })
 }
 
 pub(super) fn pending_scope_union(
@@ -319,15 +317,9 @@ pub(super) fn pending_scope_union(
 }
 
 pub(super) fn prepare_pending_ingest_recovery(
-    paths: &Paths,
     state: &mut CheckpointSession,
-) -> Result<Option<PendingIngest>> {
-    let pending_path = pending_ingest_path(paths);
-    let Some(pending) = PendingIngest::load(&pending_path)
-        .with_context(|| format!("load pending ingest at {}", pending_path.display()))?
-    else {
-        return Ok(None);
-    };
+) -> Option<PendingIngest> {
+    let pending = state.pending.clone()?;
 
     for source_path in &pending.source_paths {
         state.delete_file(source_path);
@@ -336,18 +328,18 @@ pub(super) fn prepare_pending_ingest_recovery(
         }
     }
     state.next_doc_id = state.next_doc_id.max(pending.next_doc_id);
-    Ok(Some(pending))
+    Some(pending)
 }
 
-pub(super) fn update_scan_cache(
-    paths: &Paths,
+pub(super) fn updated_scan_cache(
+    cache: Option<ScanCache>,
     files_scanned: usize,
     total_bytes: u64,
-    mut cache: ScanCache,
-) -> Result<()> {
-    let cache_path = paths.state.join("scan_cache.json");
-    cache.update(files_scanned, total_bytes);
-    cache.save(&cache_path)
+) -> Option<ScanCache> {
+    cache.map(|mut cache| {
+        cache.update(files_scanned, total_bytes);
+        cache
+    })
 }
 
 pub(super) struct RecoveredCheckpoint {
@@ -360,6 +352,7 @@ pub(super) fn recover_checkpoint(
     paths: &Paths,
     index: &SearchIndex,
     lease: &IngestLease,
+    header: Option<CheckpointHeader>,
 ) -> Result<RecoveredCheckpoint> {
     let state_path = paths.state.join("ingest.json");
     let empty_index = index.doc_count()? == 0;
@@ -386,10 +379,10 @@ pub(super) fn recover_checkpoint(
         })?;
         true
     };
-    let mut state = CheckpointSession::open(&state_path, lease, allow_initialize)?;
+    let mut state = CheckpointSession::open(&state_path, lease, allow_initialize, header)?;
     // Apply additive analytics migrations even when the scan finds no changed files.
     drop(AnalyticsStore::open(analytics_path(&paths.state))?);
-    let pending_recovery = prepare_pending_ingest_recovery(paths, &mut state)?;
+    let pending_recovery = prepare_pending_ingest_recovery(&mut state);
     cleanup_opencode_spools(&paths.state)?;
     let mut empty_index_rebuild = false;
     if empty_index && (state.has_files()? || !state.opencode_databases.is_empty()) {

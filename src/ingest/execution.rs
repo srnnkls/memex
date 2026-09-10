@@ -1127,17 +1127,13 @@ pub(super) fn execute_refresh(
         crate::profiling::count!("ingest.noop_returns", 1);
         index.publish_generation_if_uninitialized()?;
         state.opencode_databases = installed_opencode_states;
-        state.commit()?;
-        if let Some(scan_cache) = scan_cache {
-            update_scan_cache(paths, files_scanned, total_bytes, scan_cache)?;
-        }
-        if recovering_pending_ingest {
-            finalize_pending_ingest(
-                &pending_ingest_path(paths),
-                &deferred_pending_scopes,
-                state.next_doc_id,
-            )?;
-        }
+        let cache = updated_scan_cache(scan_cache, files_scanned, total_bytes);
+        let pending = if recovering_pending_ingest {
+            finalized_pending_ingest(&deferred_pending_scopes, state.next_doc_id)
+        } else {
+            PendingChange::Keep
+        };
+        state.commit_final(cache, pending)?;
         return Ok(IngestReport {
             records_added: 0,
             records_embedded: 0,
@@ -1197,7 +1193,6 @@ pub(super) fn execute_refresh(
         vector_publication,
         embedding_publication: Some(embeddings),
     };
-    let pending_path = pending_ingest_path(paths);
     let existing_records_change = !delete_paths.is_empty() || !opencode_scope_targets.is_empty();
 
     let input_bytes = if tasks.iter().any(|task| task.source == SourceKind::Opencode) {
@@ -1298,9 +1293,9 @@ pub(super) fn execute_refresh(
         || reconcile_pending_vector_ids
         || next_doc_id.load(Ordering::SeqCst) != state.next_doc_id;
     let pending_update_error = if needs_publication {
-        pending_ingest
-            .save(&pending_path)
-            .with_context(|| format!("prepare ingest publication at {}", pending_path.display()))
+        state
+            .commit_intent(&pending_ingest)
+            .context("prepare ingest publication intent")
             .err()
     } else {
         None
@@ -1361,12 +1356,9 @@ pub(super) fn execute_refresh(
         }
         state.opencode_databases = installed_opencode_states;
         state.next_doc_id = next_doc_id.load(Ordering::SeqCst);
-        state.commit()?;
-
-        if let Some(scan_cache) = scan_cache {
-            update_scan_cache(paths, files_scanned, total_bytes, scan_cache)?;
-        }
-        finalize_pending_ingest(&pending_path, &deferred_pending_scopes, state.next_doc_id)?;
+        let cache = updated_scan_cache(scan_cache, files_scanned, total_bytes);
+        let pending = finalized_pending_ingest(&deferred_pending_scopes, state.next_doc_id);
+        state.commit_final(cache, pending)?;
 
         Ok(IngestReport {
             records_added,

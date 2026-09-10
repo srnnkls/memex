@@ -136,6 +136,13 @@ impl ScanCache {
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         crate::profiling::span!("state.scan_cache.load");
+        let reader = checkpoint::CheckpointReader::open(&path.with_file_name("ingest.json"))?;
+        if reader.is_v2() {
+            return Ok(reader
+                .export_scan_cache_json()?
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default());
+        }
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -153,7 +160,23 @@ impl ScanCache {
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         crate::profiling::span!("state.scan_cache.save");
         let data = serde_json::to_string(self)?;
-        atomic_write(path, data.as_bytes())
+        checkpoint::save_sidecar(path, Some(data.as_bytes()))
+    }
+
+    pub fn save_with_lease(
+        &self,
+        path: &Path,
+        lease: &crate::lease::IngestLease,
+    ) -> anyhow::Result<()> {
+        if checkpoint::sidecar_reader(path)?.is_none() {
+            return self.save(path);
+        }
+        checkpoint::CheckpointWriter::open(&path.with_file_name("ingest.json"), lease, false)?
+            .commit_delta(&checkpoint::CheckpointDelta {
+                scan_cache: Some(self.clone()),
+                ..Default::default()
+            })?;
+        Ok(())
     }
 
     /// Check if the cache is still valid (within TTL seconds)
@@ -256,26 +279,58 @@ impl IngestState {
 impl PendingIngest {
     pub fn load(path: &Path) -> anyhow::Result<Option<Self>> {
         crate::profiling::span!("state.pending.load");
+        let reader = checkpoint::CheckpointReader::open(&path.with_file_name("ingest.json"))?;
+        if reader.is_v2() {
+            return reader
+                .export_pending_json()?
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(Into::into);
+        }
         if !path.exists() {
             return Ok(None);
         }
-        let data = fs::read_to_string(path)?;
-        Ok(Some(serde_json::from_str(&data)?))
+        let data = fs::read(path)?;
+        let value: serde_json::Value = serde_json::from_slice(&data)?;
+        anyhow::ensure!(
+            value.is_object(),
+            "pending ingest checkpoint must be an object"
+        );
+        Ok(Some(serde_json::from_value(value)?))
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         crate::profiling::span!("state.pending.save");
         let data = serde_json::to_string_pretty(self)?;
-        atomic_write(path, data.as_bytes())
+        checkpoint::save_sidecar(path, Some(data.as_bytes()))
+    }
+
+    pub fn save_with_lease(
+        &self,
+        path: &Path,
+        lease: &crate::lease::IngestLease,
+    ) -> anyhow::Result<()> {
+        if checkpoint::sidecar_reader(path)?.is_none() {
+            return self.save(path);
+        }
+        checkpoint::CheckpointWriter::open(&path.with_file_name("ingest.json"), lease, false)?
+            .commit_intent(self)
+    }
+
+    pub fn clear_with_lease(path: &Path, lease: &crate::lease::IngestLease) -> anyhow::Result<()> {
+        if checkpoint::sidecar_reader(path)?.is_none() {
+            return Self::clear(path);
+        }
+        checkpoint::CheckpointWriter::open(&path.with_file_name("ingest.json"), lease, false)?
+            .commit_delta(&checkpoint::CheckpointDelta {
+                pending: checkpoint::PendingChange::Clear,
+                ..Default::default()
+            })?;
+        Ok(())
     }
 
     pub fn clear(path: &Path) -> anyhow::Result<()> {
-        let parent = parent_directory(path)?;
-        match fs::remove_file(path) {
-            Ok(()) => sync_directory(parent),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        checkpoint::save_sidecar(path, None)
     }
 }
 

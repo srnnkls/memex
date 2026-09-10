@@ -220,16 +220,7 @@ fn memory_edits_refresh_inside_transcript_scan_ttl_without_creating_sessions() {
     );
 
     fs::write(&memory, "# Decisions\n\nRevised middle paragraph.\n").unwrap();
-    assert!(
-        can_skip_fresh_scan(
-            &ScanCache::load(&paths.state.join("scan_cache.json")).unwrap(),
-            &paths,
-            &published,
-            &options,
-            3600,
-        )
-        .unwrap()
-    );
+    assert!(can_skip_fresh_scan(&paths, &published, &options, 3600).unwrap());
     assert!(
         ingest_if_stale(&paths, &published, &options, 3600, &lease)
             .unwrap()
@@ -380,7 +371,7 @@ fn assert_recovers_cross_store_crash(lexical_advanced: bool) {
         vector_publication: false,
         embedding_publication: Some(false),
     }
-    .save(&pending_ingest_path(&paths))
+    .save_with_lease(&pending_ingest_path(&paths), &ingest_lease(&paths))
     .expect("save interrupted ingest marker");
 
     let mut interrupted = record(99, "user", "interrupted");
@@ -513,7 +504,7 @@ fn assert_recovers_vector_crash(publish_interrupted_vectors: bool, embedding_pub
         vector_publication: true,
         embedding_publication: Some(embedding_publication),
     }
-    .save(&pending_ingest_path(&paths))
+    .save_with_lease(&pending_ingest_path(&paths), &ingest_lease(&paths))
     .expect("save interrupted ingest marker");
 
     let mut interrupted = record(99, "user", "interrupted");
@@ -670,6 +661,12 @@ fn vector_only_pending_ingest_is_completed_when_embeddings_are_disabled() {
         .expect("vector inventory")
         .expect("vectors");
     assert_eq!(vectors.doc_ids, HashSet::from([1, 2]));
+    let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+    assert!(
+        state.files.is_empty(),
+        "vector-only recovery needs no file upserts"
+    );
+    assert_eq!(state.next_doc_id, 3);
     assert_eq!(
         PendingIngest::load(&pending_ingest_path(&paths)).expect("pending marker"),
         None
@@ -722,6 +719,20 @@ fn vector_recovery_runs_when_pending_session_scopes_are_present() {
         .expect("vector inventory")
         .expect("vectors");
     assert_eq!(vectors.doc_ids, HashSet::from([1, 2]));
+    let pending = PendingIngest::load(&pending_ingest_path(&paths))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.next_doc_id, 3);
+    assert!(pending.source_paths.is_empty());
+    assert!(!pending.vector_publication);
+    assert_eq!(
+        pending.session_scopes,
+        vec![SessionScope {
+            source_path: "/unavailable/opencode.db".to_string(),
+            session_id: "deferred-session".to_string(),
+        }]
+    );
+    assert!(!pending_ingest_path(&paths).exists());
 }
 
 #[test]
@@ -1154,6 +1165,60 @@ fn prepublication_pending_intent_keeps_active_and_deferred_scopes() {
 }
 
 #[test]
+fn no_publish_refresh_retains_deferred_scopes_and_updates_cache_atomically() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = save_search_records(&paths, &[record(1, "user", "original")]);
+    index.publish_generation_if_uninitialized().unwrap();
+    let lease = ingest_lease(&paths);
+    IngestState {
+        next_doc_id: 2,
+        ..Default::default()
+    }
+    .save_with_lease(&paths.state.join("ingest.json"), &lease)
+    .unwrap();
+    let first = SessionScope {
+        source_path: "/deferred-a.db".to_string(),
+        session_id: "a".to_string(),
+    };
+    let second = SessionScope {
+        source_path: "/deferred-b.db".to_string(),
+        session_id: "b".to_string(),
+    };
+    PendingIngest {
+        next_doc_id: 50,
+        source_paths: Vec::new(),
+        session_scopes: vec![second.clone(), first.clone(), second.clone()],
+        vector_publication: false,
+    }
+    .save_with_lease(&pending_ingest_path(&paths), &lease)
+    .unwrap();
+    let options = ingest_options(false, ModelChoice::Gemma);
+    let index = open_search_index(&paths);
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert_eq!(report.records_added, 0);
+    assert_eq!(indexed_texts(&paths), ["original"]);
+    let header = CheckpointReader::open(&paths.state.join("ingest.json"))
+        .unwrap()
+        .header()
+        .unwrap();
+    assert_eq!(header.next_doc_id, 50);
+    assert!(header.scan_cache.is_fresh(3600));
+    assert_eq!(header.scan_cache.file_count, 0);
+    assert_eq!(
+        header.pending,
+        Some(PendingIngest {
+            next_doc_id: 50,
+            source_paths: Vec::new(),
+            session_scopes: vec![first, second],
+            vector_publication: false,
+        })
+    );
+    assert!(!pending_ingest_path(&paths).exists());
+}
+
+#[test]
 fn pending_session_scopes_retain_database_state_for_recovery() {
     let temp = tempfile::tempdir().unwrap();
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
@@ -1188,10 +1253,8 @@ fn pending_session_scopes_retain_database_state_for_recovery() {
     let lease = ingest_lease(&paths);
     let state_path = paths.state.join("ingest.json");
     state.save_with_lease(&state_path, &lease).unwrap();
-    let mut state = CheckpointSession::open(&state_path, &lease, false).unwrap();
-    prepare_pending_ingest_recovery(&paths, &mut state)
-        .unwrap()
-        .expect("pending recovery");
+    let mut state = CheckpointSession::open(&state_path, &lease, false, None).unwrap();
+    prepare_pending_ingest_recovery(&mut state).expect("pending recovery");
     assert!(state.opencode_databases.contains_key(&database_path));
 
     PendingIngest::clear(&pending_ingest_path(&paths)).unwrap();
@@ -1208,6 +1271,15 @@ fn pending_session_scopes_retain_database_state_for_recovery() {
     prepare_pending_ingest_recovery(&paths, &mut state)
         .unwrap()
         .expect("full-path pending recovery");
+    state
+        .commit_intent(&PendingIngest {
+            next_doc_id: 1,
+            source_paths: vec![database_path.clone()],
+            session_scopes: Vec::new(),
+            vector_publication: false,
+        })
+        .unwrap();
+    prepare_pending_ingest_recovery(&mut state).expect("full-path pending recovery");
     assert!(!state.opencode_databases.contains_key(&database_path));
 }
 
@@ -1471,7 +1543,7 @@ fn modern_opencode_database_ingests_once_and_skips_noop_hydration() {
         vector_publication: false,
         embedding_publication: Some(false),
     }
-    .save(&pending_ingest_path(&paths))
+    .save_with_lease(&pending_ingest_path(&paths), &ingest_lease(&paths))
     .expect("save pending database scope");
     fs::write(&db_path, b"corrupt OpenCode database").expect("corrupt OpenCode database");
     ingest_all(&paths, &index, &options, &ingest_lease(&paths))
@@ -2412,7 +2484,8 @@ fn can_skip_fresh_scan_when_embeddings_are_disabled() {
     let cache = fresh_scan_cache();
     mark_analytics_complete(&paths);
 
-    assert!(can_skip_fresh_scan(&cache, &paths, &index, &options, 60).unwrap());
+    cache.save(&paths.state.join("scan_cache.json")).unwrap();
+    assert!(can_skip_fresh_scan(&paths, &index, &options, 60).unwrap());
 }
 
 #[test]
@@ -2425,7 +2498,8 @@ fn can_skip_fresh_scan_with_compatible_vectors() {
     let cache = fresh_scan_cache();
     mark_analytics_complete(&paths);
 
-    assert!(can_skip_fresh_scan(&cache, &paths, &index, &options, 60).unwrap());
+    cache.save(&paths.state.join("scan_cache.json")).unwrap();
+    assert!(can_skip_fresh_scan(&paths, &index, &options, 60).unwrap());
 }
 
 #[test]
@@ -2436,7 +2510,8 @@ fn cannot_skip_fresh_scan_when_vectors_are_missing() {
     let options = ingest_options(true, ModelChoice::BGESmall);
     let cache = fresh_scan_cache();
 
-    assert!(!can_skip_fresh_scan(&cache, &paths, &index, &options, 60).unwrap());
+    cache.save(&paths.state.join("scan_cache.json")).unwrap();
+    assert!(!can_skip_fresh_scan(&paths, &index, &options, 60).unwrap());
 }
 
 #[test]
@@ -2458,7 +2533,125 @@ fn cannot_skip_fresh_scan_with_pending_ingest() {
     .save(&pending_ingest_path(&paths))
     .expect("save pending ingest");
 
-    assert!(!can_skip_fresh_scan(&cache, &paths, &index, &options, 60).unwrap());
+    cache.save(&paths.state.join("scan_cache.json")).unwrap();
+    assert!(!can_skip_fresh_scan(&paths, &index, &options, 60).unwrap());
+}
+
+#[test]
+fn freshness_uses_sqlite_pending_and_cache_without_sidecars() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    let transcript = source.join("session.jsonl");
+    append_claude_message(&transcript, "original");
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let mut options = ingest_options(false, ModelChoice::Gemma);
+    options.claude_sources = vec![source];
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let index = open_search_index(&paths);
+    let cache_path = paths.state.join("scan_cache.json");
+    assert!(!cache_path.exists());
+    assert!(can_skip_fresh_scan(&paths, &index, &options, 3600).unwrap());
+    let pending_path = pending_ingest_path(&paths);
+    PendingIngest {
+        next_doc_id: 2,
+        source_paths: vec![transcript.to_string_lossy().into_owned()],
+        session_scopes: Vec::new(),
+        vector_publication: false,
+    }
+    .save_with_lease(&pending_path, &lease)
+    .unwrap();
+    assert!(!pending_path.exists());
+    assert!(!can_skip_fresh_scan(&paths, &index, &options, 3600).unwrap());
+    let header = CheckpointReader::open(&paths.state.join("ingest.json"))
+        .unwrap()
+        .header()
+        .unwrap();
+    assert!(header.pending.is_some());
+    assert!(header.scan_cache.is_fresh(3600));
+    PendingIngest::clear_with_lease(&pending_path, &lease).unwrap();
+    assert!(can_skip_fresh_scan(&paths, &index, &options, 3600).unwrap());
+    let database = rusqlite::Connection::open(paths.state.join("checkpoints.sqlite")).unwrap();
+    database
+        .execute("UPDATE metadata SET scancache_json='{}'", [])
+        .unwrap();
+    assert!(!can_skip_fresh_scan(&paths, &index, &options, 3600).unwrap());
+    fresh_scan_cache()
+        .save_with_lease(&cache_path, &lease)
+        .unwrap();
+    database
+        .execute("UPDATE metadata SET pending_json='{}'", [])
+        .unwrap();
+    assert!(can_skip_fresh_scan(&paths, &index, &options, 3600).is_err());
+}
+
+#[test]
+fn freshness_reads_legacy_and_sql_v1_sidecars_without_upgrade() {
+    for sqlite_v1 in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let state_path = paths.state.join("ingest.json");
+        let initial = IngestState {
+            next_doc_id: 2,
+            ..Default::default()
+        };
+        if sqlite_v1 {
+            initial
+                .save_with_lease(&state_path, &ingest_lease(&paths))
+                .unwrap();
+            let database =
+                rusqlite::Connection::open(paths.state.join("checkpoints.sqlite")).unwrap();
+            database
+                .execute_batch(
+                    "BEGIN;
+                ALTER TABLE metadata DROP COLUMN pending_json;
+                ALTER TABLE metadata DROP COLUMN scancache_json;
+                UPDATE metadata SET format_version=1;
+                COMMIT;",
+                )
+                .unwrap();
+            let marker: String = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+            assert!(marker.starts_with("memex-checkpoints:2:"));
+            fs::write(
+                &state_path,
+                serde_json::to_vec(&marker.replacen(
+                    "memex-checkpoints:2:",
+                    "memex-checkpoints:1:",
+                    1,
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        } else {
+            initial.save(&state_path).unwrap();
+        }
+        let marker = fs::read(&state_path).unwrap();
+        let index = save_search_records(&paths, &[record(1, "user", "original")]);
+        mark_analytics_complete(&paths);
+        let options = ingest_options(false, ModelChoice::Gemma);
+        fresh_scan_cache()
+            .save(&paths.state.join("scan_cache.json"))
+            .unwrap();
+        assert!(can_skip_fresh_scan(&paths, &index, &options, 3600).unwrap());
+        let pending_path = pending_ingest_path(&paths);
+        PendingIngest {
+            next_doc_id: 2,
+            source_paths: vec!["source-1.jsonl".to_string()],
+            session_scopes: Vec::new(),
+            vector_publication: false,
+        }
+        .save(&pending_path)
+        .unwrap();
+        assert!(!can_skip_fresh_scan(&paths, &index, &options, 3600).unwrap());
+        assert_eq!(fs::read(&state_path).unwrap(), marker);
+        fs::write(&pending_path, b"{").unwrap();
+        assert!(can_skip_fresh_scan(&paths, &index, &options, 3600).is_err());
+        assert_eq!(fs::read(&state_path).unwrap(), marker);
+    }
 }
 
 #[test]
@@ -2475,7 +2668,10 @@ fn database_discovery_error_never_allows_fresh_scan_skip() {
     options.include_opencode = true;
     mark_analytics_complete(&paths);
 
-    assert!(!can_skip_fresh_scan(&fresh_scan_cache(), &paths, &index, &options, 60).unwrap());
+    fresh_scan_cache()
+        .save(&paths.state.join("scan_cache.json"))
+        .unwrap();
+    assert!(!can_skip_fresh_scan(&paths, &index, &options, 60).unwrap());
     assert!(ingest_all(&paths, &index, &options, &ingest_lease(&paths)).is_err());
     assert_eq!(index.doc_count().expect("preserved documents"), 1);
 }
@@ -2489,7 +2685,8 @@ fn cannot_skip_fresh_scan_with_incompatible_vectors() {
     let options = ingest_options(true, ModelChoice::BGESmall);
     let cache = fresh_scan_cache();
 
-    assert!(!can_skip_fresh_scan(&cache, &paths, &index, &options, 60).unwrap());
+    cache.save(&paths.state.join("scan_cache.json")).unwrap();
+    assert!(!can_skip_fresh_scan(&paths, &index, &options, 60).unwrap());
 }
 
 #[test]
@@ -2505,7 +2702,8 @@ fn cannot_skip_fresh_scan_when_cache_is_stale() {
         directory_inventory: None,
     };
 
-    assert!(!can_skip_fresh_scan(&cache, &paths, &index, &options, 60).unwrap());
+    cache.save(&paths.state.join("scan_cache.json")).unwrap();
+    assert!(!can_skip_fresh_scan(&paths, &index, &options, 60).unwrap());
 }
 
 #[test]
@@ -2516,7 +2714,13 @@ fn updating_scan_cache_replaces_malformed_cache() {
     let cache_path = paths.state.join("scan_cache.json");
     fs::write(&cache_path, "{\"last_scan_ts\":").expect("seed malformed cache");
 
-    update_scan_cache(&paths, 7, 42, ScanCache::default()).expect("update scan cache");
+    let lease = ingest_lease(&paths);
+    let mut state =
+        CheckpointSession::open(&paths.state.join("ingest.json"), &lease, true, None).unwrap();
+    let cache = updated_scan_cache(Some(std::mem::take(&mut state.scan_cache)), 7, 42);
+    state
+        .commit_final(cache, PendingChange::Keep)
+        .expect("update scan cache");
 
     let cache = ScanCache::load(&cache_path).expect("load replaced cache");
     assert_eq!(cache.file_count, 7);
@@ -3261,7 +3465,7 @@ fn targeted_ingest_only_updates_selected_files_until_reconciliation() {
         2
     );
     let cache_path = paths.state.join("scan_cache.json");
-    let original_cache = fs::read(&cache_path).unwrap();
+    let original_cache = serde_json::to_value(ScanCache::load(&cache_path).unwrap()).unwrap();
     let state_before = IngestState::load(&paths.state.join("ingest.json")).unwrap();
     append_claude_message(&first, "first appended");
     append_claude_message(&second, "second missed event");
@@ -3284,14 +3488,30 @@ fn targeted_ingest_only_updates_selected_files_until_reconciliation() {
         state_before.files[key.as_ref()].offset
     );
     assert_eq!(state_after.files.len(), 2);
-    assert_eq!(fs::read(&cache_path).unwrap(), original_cache);
+    assert_eq!(
+        serde_json::to_value(ScanCache::load(&cache_path).unwrap()).unwrap(),
+        original_cache
+    );
 
     // A no-op batch must not mark a complete scan fresh either.
+    let database = rusqlite::Connection::open(paths.state.join("checkpoints.sqlite")).unwrap();
+    let version: i64 = database
+        .pragma_query_value(None, "data_version", |row| row.get(0))
+        .unwrap();
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
     let result = ingest_dirty(&paths, &index, &options, &lease, &dirty).unwrap();
+    assert_eq!(
+        database
+            .pragma_query_value(None, "data_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        version
+    );
     assert!(!result.full_scan);
     assert_eq!(result.report.records_added, 0);
-    assert_eq!(fs::read(&cache_path).unwrap(), original_cache);
+    assert_eq!(
+        serde_json::to_value(ScanCache::load(&cache_path).unwrap()).unwrap(),
+        original_cache
+    );
 
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
     let report = ingest_all(&paths, &index, &options, &lease).unwrap();
@@ -3380,7 +3600,7 @@ fn targeted_ingest_escalates_pending_publication_to_full_recovery() {
         vector_publication: false,
         embedding_publication: Some(false),
     }
-    .save(&pending_ingest_path(&paths))
+    .save_with_lease(&pending_ingest_path(&paths), &lease)
     .unwrap();
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
     let result = ingest_dirty(&paths, &index, &options, &lease, &HashSet::from([first])).unwrap();
@@ -3395,7 +3615,11 @@ fn targeted_ingest_escalates_pending_publication_to_full_recovery() {
             "second original"
         ]
     );
-    assert!(!pending_ingest_path(&paths).exists());
+    assert!(
+        PendingIngest::load(&pending_ingest_path(&paths))
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -4207,7 +4431,7 @@ fn checkpoint_session_keeps_unloaded_absent_and_deleted_paths_distinct() {
         ..IngestState::default()
     };
     initial.save_with_lease(&state_path, &lease).unwrap();
-    let mut state = CheckpointSession::open(&state_path, &lease, false).unwrap();
+    let mut state = CheckpointSession::open(&state_path, &lease, false, None).unwrap();
     state
         .preload(&["known".to_string(), "absent".to_string()])
         .unwrap();
@@ -4218,18 +4442,31 @@ fn checkpoint_session_keeps_unloaded_absent_and_deleted_paths_distinct() {
     assert!(state.contains_file("unloaded").unwrap());
     assert!(!state.loaded.contains_key("unloaded"));
     state.upsert_file("known".to_string(), file);
-    assert!(!state.commit().unwrap());
+    assert!(!state.commit_final(None, PendingChange::Keep).unwrap());
     state.delete_file("unloaded");
     state.preload(&["unloaded".to_string()]).unwrap();
     assert!(state.file("unloaded").is_none());
+    let pending = PendingIngest {
+        next_doc_id: 99,
+        source_paths: vec!["known".to_string()],
+        session_scopes: Vec::new(),
+        vector_publication: false,
+    };
+    state.next_doc_id = 99;
+    state.commit_intent(&pending).unwrap();
+    assert_eq!(
+        PendingIngest::load(&pending_ingest_path(&paths)).unwrap(),
+        Some(pending)
+    );
+    assert_eq!(IngestState::load(&state_path).unwrap().next_doc_id, 20);
     assert!(
         IngestState::load(&state_path)
             .unwrap()
             .files
             .contains_key("unloaded")
     );
-    assert!(state.commit().unwrap());
-    assert!(!state.commit().unwrap());
+    assert!(state.commit_final(None, PendingChange::Keep).unwrap());
+    assert!(!state.commit_final(None, PendingChange::Keep).unwrap());
     let saved = IngestState::load(&state_path).unwrap();
     assert_eq!(saved.files.len(), 1);
     assert_eq!(saved.files["known"], initial.files["known"]);
@@ -4264,7 +4501,7 @@ fn full_single_source_reads_and_writes_only_discovered_checkpoint() {
         CREATE TRIGGER audit_file_update AFTER UPDATE ON files BEGIN INSERT INTO changed_paths VALUES (NEW.path); END;").unwrap();
     append_claude_message(&transcript, "appended");
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
-    let recovered = recover_checkpoint(&paths, &index, &lease).unwrap();
+    let recovered = recover_checkpoint(&paths, &index, &lease, None).unwrap();
     assert!(recovered.state.loaded.is_empty());
     let pool = parser_thread_pool().unwrap();
     let prepared = prepare_refresh(&paths, &index, &options, &pool, recovered, None, None).unwrap();
@@ -4293,6 +4530,10 @@ fn full_single_source_reads_and_writes_only_discovered_checkpoint() {
     for (path, file) in original.files.iter().filter(|(path, _)| *path != &key) {
         assert_eq!(&saved.files[path], file);
     }
+    let cache_path = paths.state.join("scan_cache.json");
+    let mut expired_cache = ScanCache::load(&cache_path).unwrap();
+    expired_cache.last_scan_ts = 1;
+    expired_cache.save_with_lease(&cache_path, &lease).unwrap();
     let version: i64 = database
         .query_row("PRAGMA data_version", [], |row| row.get(0))
         .unwrap();
@@ -4306,7 +4547,26 @@ fn full_single_source_reads_and_writes_only_discovered_checkpoint() {
     let after: i64 = database
         .query_row("PRAGMA data_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, after, "no-op must not commit checkpoint writes");
+    assert_eq!(after, version + 1, "full no-op commits only the scan cache");
+    let refreshed_cache = ScanCache::load(&cache_path).unwrap();
+    assert!(refreshed_cache.is_fresh(3600));
+    refreshed_cache
+        .save_with_lease(&cache_path, &lease)
+        .unwrap();
+    assert_eq!(
+        database
+            .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        after,
+        "saving the same cache must not change checkpoint rows"
+    );
+    let changed_rows: usize = database
+        .query_row("SELECT count(*) FROM changed_paths", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        changed_rows, 1,
+        "full no-op must not rewrite file checkpoints"
+    );
 }
 
 #[test]
@@ -4325,8 +4585,18 @@ fn checkpoint_failure_after_publication_keeps_pending_recoverable() {
     ingest_all(&paths, &index, &options, &lease).unwrap();
     let state_path = paths.state.join("ingest.json");
     let before = IngestState::load(&state_path).unwrap();
+    let cache_path = paths.state.join("scan_cache.json");
+    ScanCache {
+        last_scan_ts: 1,
+        file_count: 7,
+        total_bytes: 42,
+        directory_inventory: None,
+    }
+    .save_with_lease(&cache_path, &lease)
+    .unwrap();
+    let cache_before = serde_json::to_value(ScanCache::load(&cache_path).unwrap()).unwrap();
     let database = rusqlite::Connection::open(paths.state.join("checkpoints.sqlite")).unwrap();
-    database.execute_batch("CREATE TRIGGER fail_checkpoint BEFORE INSERT ON files BEGIN SELECT RAISE(FAIL, 'checkpoint failure'); END;").unwrap();
+    database.execute_batch("CREATE TRIGGER fail_checkpoint BEFORE UPDATE OF scancache_json ON metadata BEGIN SELECT RAISE(FAIL, 'checkpoint failure'); END;").unwrap();
     append_claude_message(&transcript, "appended");
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
     let error = ingest_all(&paths, &index, &options, &lease).unwrap_err();
@@ -4336,7 +4606,18 @@ fn checkpoint_failure_after_publication_keeps_pending_recoverable() {
             .unwrap()
             .is_some()
     );
-    assert_eq!(IngestState::load(&state_path).unwrap().files, before.files);
+    let saved = IngestState::load(&state_path).unwrap();
+    assert_eq!(saved.files, before.files);
+    assert_eq!(saved.next_doc_id, before.next_doc_id);
+    assert_eq!(saved.opencode_databases, before.opencode_databases);
+    assert_eq!(
+        serde_json::to_value(ScanCache::load(&cache_path).unwrap()).unwrap(),
+        cache_before
+    );
+    assert!(
+        !pending_ingest_path(&paths).exists(),
+        "intent must be durable in SQLite"
+    );
     assert_eq!(indexed_texts(&paths), ["appended", "original"]);
     database
         .execute_batch("DROP TRIGGER fail_checkpoint;")
@@ -4344,7 +4625,98 @@ fn checkpoint_failure_after_publication_keeps_pending_recoverable() {
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
     ingest_all(&paths, &index, &options, &lease).unwrap();
     assert_eq!(indexed_texts(&paths), ["appended", "original"]);
-    assert!(!pending_ingest_path(&paths).exists());
+    assert!(
+        PendingIngest::load(&pending_ingest_path(&paths))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn early_intent_failure_cancels_publication_without_flushing_recovery_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    let transcript = source.join("session.jsonl");
+    append_claude_message(&transcript, "original");
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let mut options = ingest_options(false, ModelChoice::Gemma);
+    options.claude_sources = vec![source];
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let state_path = paths.state.join("ingest.json");
+    let before = IngestState::load(&state_path).unwrap();
+    let key = transcript.to_string_lossy().into_owned();
+    let pending = PendingIngest {
+        next_doc_id: 100,
+        source_paths: vec![key.clone()],
+        session_scopes: Vec::new(),
+        vector_publication: false,
+    };
+    pending
+        .save_with_lease(&pending_ingest_path(&paths), &lease)
+        .unwrap();
+    let cache_before =
+        serde_json::to_value(ScanCache::load(&paths.state.join("scan_cache.json")).unwrap())
+            .unwrap();
+    append_claude_message(&transcript, "appended");
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let recovered = recover_checkpoint(&paths, &index, &lease, None).unwrap();
+    assert_eq!(recovered.state.next_doc_id, 100);
+    assert!(!recovered.state.contains_file(&key).unwrap());
+    let pool = parser_thread_pool().unwrap();
+    let mut prepared =
+        prepare_refresh(&paths, &index, &options, &pool, recovered, None, None).unwrap();
+    prepared
+        .state
+        .upsert_file("unpublished".to_string(), before.files[&key].clone());
+    prepared
+        .state
+        .opencode_databases
+        .insert("unpublished.db".to_string(), Default::default());
+    let database = rusqlite::Connection::open(paths.state.join("checkpoints.sqlite")).unwrap();
+    database.execute_batch("CREATE TRIGGER fail_intent BEFORE UPDATE OF pending_json ON metadata BEGIN SELECT RAISE(FAIL, 'intent failure'); END;").unwrap();
+    let error = execute_refresh(
+        prepared,
+        &paths,
+        &index,
+        &options,
+        Arc::new(crate::repository::RepositoryResolver::default()),
+        &pool,
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("intent failure"));
+    let saved = IngestState::load(&state_path).unwrap();
+    assert_eq!(saved.files, before.files);
+    assert_eq!(saved.next_doc_id, before.next_doc_id);
+    assert_eq!(saved.opencode_databases, before.opencode_databases);
+    assert_eq!(
+        PendingIngest::load(&pending_ingest_path(&paths)).unwrap(),
+        Some(pending)
+    );
+    assert_eq!(
+        serde_json::to_value(ScanCache::load(&paths.state.join("scan_cache.json")).unwrap())
+            .unwrap(),
+        cache_before
+    );
+    assert_eq!(indexed_texts(&paths), ["original"]);
+    let analytics = AnalyticsStore::open(analytics_path(&paths.state)).unwrap();
+    let sessions = analytics
+        .query_sessions_detailed(None, None, None, None, None)
+        .unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].message_count, 1);
+    drop(
+        index
+            .writer()
+            .expect("cancelled writer must be joined and released"),
+    );
+    database.execute_batch("DROP TRIGGER fail_intent").unwrap();
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert_eq!(indexed_texts(&paths), ["appended", "original"]);
 }
 
 #[test]
@@ -4369,9 +4741,13 @@ fn missing_checkpoint_requires_complete_pending_record_coverage() {
         .save(&pending_ingest_path(&paths))
         .unwrap();
         let lease = ingest_lease(&paths);
-        let recovered = recover_checkpoint(&paths, &index, &lease);
+        let recovered = recover_checkpoint(&paths, &index, &lease, None);
         assert_eq!(recovered.is_ok(), succeeds);
-        assert!(pending_ingest_path(&paths).exists());
+        assert!(
+            PendingIngest::load(&pending_ingest_path(&paths))
+                .unwrap()
+                .is_some()
+        );
         if let Ok(recovered) = recovered {
             assert_eq!(recovered.state.next_doc_id, 2);
             assert_eq!(
@@ -4384,4 +4760,14 @@ fn missing_checkpoint_requires_complete_pending_record_coverage() {
             assert!(!paths.state.join("ingest.json").exists());
         }
     }
+}
+
+fn can_skip_fresh_scan(
+    paths: &Paths,
+    index: &SearchIndex,
+    options: &IngestOptions,
+    ttl_seconds: u64,
+) -> Result<bool> {
+    let header = CheckpointReader::open(&paths.state.join("ingest.json"))?.header()?;
+    super::can_skip_fresh_scan(&header, paths, index, options, ttl_seconds)
 }

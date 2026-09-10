@@ -1,6 +1,6 @@
 use super::*;
 use crate::state::OpencodeDatabaseState;
-use crate::state::checkpoint::{CheckpointDelta, CheckpointWriter};
+use crate::state::checkpoint::{CheckpointDelta, CheckpointWriter, PendingChange};
 
 pub(super) struct CheckpointSession {
     writer: CheckpointWriter,
@@ -10,12 +10,22 @@ pub(super) struct CheckpointSession {
     original_opencode_databases: HashMap<String, OpencodeDatabaseState>,
     pub next_doc_id: u64,
     pub opencode_databases: HashMap<String, OpencodeDatabaseState>,
+    pub pending: Option<PendingIngest>,
+    pub scan_cache: ScanCache,
 }
 
 impl CheckpointSession {
-    pub fn open(path: &Path, lease: &IngestLease, allow_initialize: bool) -> Result<Self> {
+    pub fn open(
+        path: &Path,
+        lease: &IngestLease,
+        allow_initialize: bool,
+        header: Option<CheckpointHeader>,
+    ) -> Result<Self> {
         let writer = CheckpointWriter::open(path, lease, allow_initialize)?;
-        let header = writer.reader().header()?;
+        let header = match header {
+            Some(header) => header,
+            None => writer.reader().header()?,
+        };
         Ok(Self {
             writer,
             loaded: HashMap::new(),
@@ -24,6 +34,8 @@ impl CheckpointSession {
             original_opencode_databases: header.opencode_databases.clone(),
             next_doc_id: header.next_doc_id,
             opencode_databases: header.opencode_databases,
+            pending: header.pending,
+            scan_cache: header.scan_cache,
         })
     }
 
@@ -117,13 +129,34 @@ impl CheckpointSession {
         self.delta.upserts.insert(path, file);
     }
 
-    pub fn commit(&mut self) -> Result<bool> {
+    pub fn commit_intent(&mut self, pending: &PendingIngest) -> Result<()> {
+        self.writer.commit_intent(pending)?;
+        self.pending = Some(pending.clone());
+        Ok(())
+    }
+
+    pub fn commit_final(
+        &mut self,
+        cache: Option<ScanCache>,
+        pending: PendingChange,
+    ) -> Result<bool> {
+        crate::profiling::span!("state.checkpoint.commit_final");
+        self.delta.scan_cache = cache;
+        self.delta.pending = pending;
         self.delta.next_doc_id =
             (self.next_doc_id != self.original_next_doc_id).then_some(self.next_doc_id);
         self.delta.opencode_databases = (self.opencode_databases
             != self.original_opencode_databases)
             .then(|| self.opencode_databases.clone());
         let changed = self.writer.commit_delta(&self.delta)?;
+        if let Some(cache) = self.delta.scan_cache.take() {
+            self.scan_cache = cache;
+        }
+        match std::mem::take(&mut self.delta.pending) {
+            PendingChange::Keep => {}
+            PendingChange::Replace(pending) => self.pending = Some(pending),
+            PendingChange::Clear => self.pending = None,
+        }
         self.delta = CheckpointDelta::default();
         self.original_next_doc_id = self.next_doc_id;
         self.original_opencode_databases = self.opencode_databases.clone();

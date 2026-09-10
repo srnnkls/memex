@@ -1,5 +1,80 @@
 # Foreground merge cost model
 
+## Two-phase checkpoint state: 154.0651 to 135.0057 ms including v2 adoption
+
+2026-09-10. Moving pending intent and scan-cache persistence into the checkpoint database lowers adoption-inclusive aggregate elapsed time by 12.3710% against freshly measured checkpoint-v1. Both variants are memex 0.18.1. The [checkpoint storage contract](checkpoint-storage.md) defines authority, upgrade, transactional publication, and recovery; this comparison does not weaken its durability barriers.
+
+| Repeat | Variant | 260 appends + queries, including first use | Terminal index/SQLite maintenance + final query | Total charged wall time |
+|---|---|---:|---:|---:|
+| 0 | Checkpoint-v1 baseline | 36.319105 s | 4.077825 s | 40.396930 s |
+| 0 | Candidate v2 | 30.947421 s | 3.925697 s | 34.873118 s |
+| 1 | Checkpoint-v1 baseline | 35.701303 s | 4.015633 s | 39.716936 s |
+| 1 | Candidate v2 | 30.959359 s | 4.370466 s | 35.329825 s |
+
+The repetitions improve by 13.6738% and 11.0459%. Across 520 twenty-record cycles per variant, totals are 80.113866 versus 70.202942 seconds, or 154.0651 versus 135.0057 ms per cycle including every query, first-call v1-to-v2 upgrade, native terminal compaction, SQLite truncation, and final query. All 2,088 measured subprocesses and every outlier remain included. Candidate terminal maintenance plus final query regresses in repeat 1 and increases overall from 8.093458 to 8.296162 seconds; none of that additional work is deferred outside acceptance. Native maintenance alone increases from 8.061029 to 8.264489 seconds.
+
+The common starting format is SQL v1, not the previous experiment's legacy JSON. One native v1 migration-only helper converts a complete legacy clone before either variant runs. Independent hashes prove that all 372 index files and every noncheckpoint file remain unchanged, including the original pending/cache sidecars; complete logical checkpoints also match. This is common baseline-format preparation, not untimed per-variant ingestion. Each candidate's first timed index call upgrades the database, marker and sidecars. First production index calls are 1,431.477 versus 1,392.722 ms in repeat 0 and 1,274.351 versus 1,473.370 ms in repeat 1. They include initial merging and process startup, so their differences do not isolate upgrade cost.
+
+The supplementary after-first-update result removes the first index/query pair symmetrically, retains terminal costs, and uses 259 cycles per repetition: 149.3238 versus 129.8831 ms per cycle. It is separate from adoption-inclusive acceptance and is not an estimated migration-subtracted latency.
+
+### Complete state, compatibility, and deferred work
+
+The seed retains 740,555 live documents in 58 segments and all 7,857 file checkpoints. Both repetitions use the same controlled twenty-record append/query sequence, reversed pair and terminal order, disabled embeddings and disabled automatic query indexing. No source IDs, checkpoint rows, providers' retained data, or outliers are omitted. Blocking process waits use an independent deadline and source-mutation guards; actual real-time timestamps are captured outside the measured monotonic interval. Every measured call retains a 13 GiB free-space reserve plus operation headroom. Builds and tests cease before timing starts.
+
+All 2,092 production checkpoint snapshots reconcile with allocator/offset/turn progression and preservation of unrelated rows, OpenCode metadata, raw extensions, pending intent and scan cache. Between calls, validation uses bounded read-only SQL metadata/source/count queries and v1 sidecar JSON; APFS snapshots are exported in full only after both production repetitions finish. V2 validation reads database columns only, never stale sidecars. Cross-variant equality normalizes only `cache.last_scan_ts`; each full-scan timestamp independently falls within that call's actual real-time bounds. Queries and maintenance preserve the complete cache exactly. Successful normal calls leave pending intent absent; native deferred/vector-only recovery tests cover nonempty intent separately.
+
+Both variants pay their own native Tantivy maintenance and checked SQLite `TRUNCATE`. Candidate WAL bytes are zero at maintenance completion and after the final query. All four production endpoints and both diagnostic endpoints match: 745,755 live documents in four segments, the same three retained partitions, and a deletion-free 42,939-document remainder. Stored-document fingerprint: `acd2763942671110e354388b2df0f5b7f0bf65ca59785a468d696955f1450877`. Full fingerprints follow all timing, and the controlled source is restored.
+
+After smoke, the real v1 executable refuses both marker2/database2 and marker1/database2 fixtures without changing any fixture file. On the latter owned clone, a candidate query reads authoritative database metadata despite deliberately stale JSON, without activating the marker. Candidate native maintenance completes activation to marker2 without source ingestion or logical checkpoint changes; its final query and empty WAL also pass. The original smoke endpoint and controlled source remain unchanged. These checks do not authorize rollback by restoring stale sidecars or legacy backups.
+
+### Paired trace and CPU explanation
+
+Separate diagnostics cover 260 index/query cycles per variant and terminal work. Same-invocation Samply captures accompany index steps 0, 127, 255 and 259 plus native terminal maintenance: five pairs, ten CPU-weighted flamegraphs. All operations have complete phase traces; diagnostic elapsed totals are not production acceptance measurements.
+
+| Diagnostic elapsed span, summed across 260 index calls | Baseline v1 | Candidate v2 |
+|---|---:|---:|
+| `state.pending.save` | 2,710.294 ms | Replaced by database intent commit |
+| `state.scan_cache.save` | 2,776.035 ms | Included in final database transaction |
+| `state.checkpoint.commit_intent` | Not instrumented as a database phase | 1,954.960 ms |
+| `state.checkpoint.commit_final` | No enclosing final-transaction span | 1,454.350 ms |
+| `state.checkpoint.commit_delta` | 1,806.735 ms | 1,447.573 ms, nested inside `commit_final` |
+| `state.checkpoint.open_writer` | 223.599 ms | 297.768 ms |
+| `lexical.publish` | 9,024.352 ms | 9,257.100 ms |
+
+These measurements support reduced state-publication elapsed cost, not an additive decomposition of the production saving. Candidate `commit_delta` is already inside `commit_final`; adding both double-counts the same work. Writer opening and lexical publication get more expensive. The diagnostic candidate upgrade appears once, at 45.361 ms; terminal SQLite-maintenance spans are 20.546 versus 21.083 ms. Both are nested in charged native calls, and no diagnostic span is subtracted from production.
+
+Candidate counters record 260 early intent writes and 260 final delta transactions, one file upsert per index call, no deletions, and 518 decoded existing file rows. Baseline also records 260 delta transactions. These counters do not count every SQL read or upgrade transaction. Both variants retain 260 strict lexical `full_syncs` and 6,052 staging fsyncs across index calls; these are named call-site counters, not a complete physical-device flush count.
+
+Production subprocess resource CPU, measured through child `getrusage`, is 43.233385 versus 43.311000 seconds. This is not the sampled flamegraph total. Across the five diagnostic sampled pairs, positive thread-CPU totals are 4,756.494 versus 4,658.845 CPU-ms. Initial inclusive merge-stack CPU is 1,107.292 versus 1,118.634 CPU-ms; terminal merge CPU is 3,113.724 versus 3,008.035 CPU-ms. The initial and terminal stacks retain substantial Tantivy merger, FST and postings work; step 259 has zero merge CPU in both variants. Step 255 is not a CPU win: total sampled CPU rises from 91.111 to 98.906 CPU-ms. Inclusive categories overlap and cannot be summed. No CPU measure is subtracted from wall time to manufacture physical-I/O wait or an isolated synchronization saving.
+
+Production append indexing accounts for 9.956644 seconds of savings, 61.634141 versus 51.677498 seconds, while terminal maintenance regresses. This supports the lower complete aggregate without claiming a broad merger-computation speedup. Representative candidate terminal and step-259 PNGs were rendered at 1400 px and visually inspected: `analysis/r0-candidate-terminal-maintenance.cpu.png` and `analysis/r0-candidate-259-index.cpu.png`. Their widths represent sampled CPU; corresponding SVGs retain frame hover details, and `.cpu.json`/`.cpu-us.folded` files retain numerical attribution.
+
+### Exact provenance, validation, and limits
+
+The baseline production executable is the original checkpoint-v1 `72d89112…` artifact, not a rebuilt diagnostic overlay. Production-input equality is proved against committed `4388980d3c726744f2bd8a9924cad99d2959f7d3` plus the preserved watcher-test correction. Imported production-helper receipts retain their original test code and historical FSEvents failure; the corrected test is absent from that old helper, while its benchmark maintenance code and production inputs match. Fresh v1 diagnostic binaries use a separately verified overlay containing only five static span calls and a `cfg(test)` migration helper. Stripping that overlay restores the frozen baseline byte-for-byte. Baseline/candidate lock-wait span boundaries match, and profiling capture code/schema is unchanged.
+
+| Native artifact | SHA-256 |
+|---|---|
+| Baseline production | `72d891122d3b1464997830c550b3a9bcd7794637b2b5b42ff250d4ee428d89b7` |
+| Baseline production helper | `53c19e8f9b8fdf0a42f03e017890590685ca57ba2947165ba01643cdfe540373` |
+| Baseline diagnostic | `2faaef356d444e825f80a01b914e19f86dd812aba0423f2be73cf57bfb79af0b` |
+| Baseline diagnostic helper | `8930b62cd887aad7747e01c2d4db568421717c5c3604b32fcc2f05f4d16ca93f` |
+| Common-v1 seed migrator | `d96116f9206fec02af47bc020ed8fa4f655b8bdbf65236303b567fb2355ff2af` |
+| Candidate production | `6d447778c5643da16ae837b459b3683b53680416b132caefae4c31846d2daad0` |
+| Candidate production helper | `abbce90fbe59c2c0e1a84a20f442c85110f65643ec84e40160124cda4b735436` |
+| Candidate diagnostic | `bad25bd284c80d878fd098f1afb18062e364a2bdc400cb9f7bcd978092b569af` |
+| Candidate diagnostic helper | `bcb6e72a7b7e053a48846fd2d60094258f0284a967090213f9481c600afa9c83` |
+
+The frozen baseline manifest is `d45352c5d2f8d6811712e8f3c23c03c23741ad4107828eae699b19cea3fae977`; its diagnostic-overlay manifest is `1d903709dac2e1db9a8bffd086ac40ad2e384b0d43d923bee574e376b9486140`. Candidate's 220-file manifest is `5a30c0c56bb52c2b56c811ce4f326fb58320caae3fcf568fb82521ec8f389c38`, with reconstructed patch `729d2fd14f33eb606f9db94b817d557b220acca8e3ac160d662a7e0b299d81f2` relative to that frozen `baseline-src`, not relative to an older release or diagnostic overlay. All four candidate compiler artifacts pass the strict fresh-compilation provenance check.
+
+Frozen candidate default/profile library suites pass 782/783 tests respectively, with zero failures, four intentional ignores and zero filtered tests. Both Clippy configurations and all five integration suites per mode pass: 35 default and 38 profiling tests. Formatting passes. Native tests cover early-intent cancellation, independent staged/final rollback, deferred and vector-only recovery, cache-only finalization, malformed pending versus lenient cache, opaque extensions, upgrade failure boundaries, marker/version refusal, read-only transitional authority, and missing lifecycle locks. The corrected FSEvents test passes in these suites; historical failures below remain historical evidence, not retroactively passing results.
+
+The first frozen build attempt exited Cargo successfully but failed the strict provenance gate because its compiler artifact was cached (`fresh:true`); it produced no benchmark timings. That failure is preserved under `candidate-attempt1/`. The final freeze corrects span comparability and its authorized rebuild passes the unchanged `fresh:false` gate. `candidate-native-completion.json` and `candidate-native-cache-release.json` establish successful tests and zero build/test processes before measurements.
+
+Evidence is under `/Users/srnnkls/Library/Caches/memex-statecommit-aggregate-20260910`: `seed-preparation.json`, `baseline-production-import.json`, `baseline-production-input-equality.json`, `baseline-diagnostic-overlay-proof.json`, source manifests/proofs, `artifact-readiness.json`, and native receipts identify exact inputs. `production/{summary.json,rows.jsonl,calls.jsonl,checkpoint-validation.json,fingerprints.jsonl,source-restoration.json}`, the matching `diagnostic/` cohort, `old-binary-refusal/receipt.json`, and `analysis/{production.json,diagnostic.json,traces.json}` retain complete results. Final `harness-readiness.json` verifies unchanged frozen sources, all nine binaries, harness hashes and common seed; approximately 14.03 GiB remained free.
+
+No installation, live-root migration, commit or push occurred in this experiment. This is one corpus, host and append/query cadence with two reversed-order repetitions, not a statistical bound, cold-cache guarantee, automatic-search latency or all-provider discovery result. Host load and cache carryover remain uncontrolled. Do not combine its percentage with earlier experiments, reuse historical timings as the matched baseline, or interpret failure-injection checks as physical power-loss validation.
+
 ## Per-file checkpoints: 158.96 to 148.77 ms including adoption
 
 2026-09-09. Per-file checkpoint persistence lowers adoption-inclusive aggregate elapsed time by 6.41% against the preserved cleanup candidate. Both are 0.18.1 builds; the baseline is the uncommitted cleanup build, not the older globally installed executable. The [checkpoint storage contract](checkpoint-storage.md) defines the schema, migration, lifecycle protection, compatibility, and retained recovery boundaries.

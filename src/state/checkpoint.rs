@@ -1,4 +1,4 @@
-use super::{FileState, IngestState, OpencodeDatabaseState};
+use super::{FileState, IngestState, OpencodeDatabaseState, PendingIngest, ScanCache};
 use crate::lease::IngestLease;
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -16,13 +16,36 @@ mod tests;
 
 const DATABASE: &str = "checkpoints.sqlite";
 const LOCK: &str = ".checkpoints.lock";
-const FORMAT_VERSION: i64 = 1;
+const FORMAT_VERSION: i64 = 2;
+const INGEST: &str = "ingest.json";
+const PENDING: &str = "ingest.pending.json";
+const SCAN_CACHE: &str = "scan_cache.json";
+const JSON_ARTIFACTS: &[&str] = &[INGEST, PENDING, SCAN_CACHE];
+const ACTIVE_ARTIFACTS: &[&str] = &[
+    DATABASE,
+    "checkpoints.sqlite-wal",
+    "checkpoints.sqlite-shm",
+    "checkpoints.sqlite-journal",
+    INGEST,
+    PENDING,
+    SCAN_CACHE,
+];
 const MARKER_PREFIX: &str = "memex-checkpoints:";
 
 #[derive(Debug)]
 pub(crate) struct CheckpointHeader {
     pub next_doc_id: u64,
     pub opencode_databases: HashMap<String, OpencodeDatabaseState>,
+    pub pending: Option<PendingIngest>,
+    pub scan_cache: ScanCache,
+}
+
+#[derive(Default)]
+pub(crate) enum PendingChange {
+    #[default]
+    Keep,
+    Replace(PendingIngest),
+    Clear,
 }
 
 #[derive(Default)]
@@ -32,16 +55,20 @@ pub(crate) struct CheckpointDelta {
     pub clear_files: bool,
     pub next_doc_id: Option<u64>,
     pub opencode_databases: Option<HashMap<String, OpencodeDatabaseState>>,
+    pub pending: PendingChange,
+    pub scan_cache: Option<ScanCache>,
 }
 
 pub(crate) struct CheckpointReader {
     backend: Backend,
+    state_path: PathBuf,
 }
 
 enum Backend {
     Legacy(Value),
     Sqlite {
         connection: Connection,
+        version: i64,
         _lease: File,
     },
 }
@@ -55,27 +82,90 @@ impl CheckpointReader {
         lifecycle::open_reader(state_path)
     }
 
+    pub(super) fn is_v2(&self) -> bool {
+        matches!(self.backend, Backend::Sqlite { version: 2, .. })
+    }
+
     pub(crate) fn header(&self) -> Result<CheckpointHeader> {
-        match &self.backend {
+        if let Backend::Sqlite {
+            connection,
+            version: 2,
+            ..
+        } = &self.backend
+        {
+            let (next_id, databases, pending, cache): (String, String, Option<String>, Option<String>) = connection.query_row(
+                "SELECT next_doc_id,opencode_databases,pending_json,CASE WHEN length(CAST(scancache_json AS BLOB)) <= ?1 THEN scancache_json END FROM metadata WHERE singleton=1", [ScanCache::MAX_JSON_BYTES],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            return Ok(CheckpointHeader {
+                next_doc_id: parse_next_id(&next_id)?,
+                opencode_databases: serde_json::from_str(&databases)?,
+                pending: pending.as_deref().map(serde_json::from_str).transpose()?,
+                scan_cache: codec::scan_cache(cache.as_deref()),
+            });
+        }
+        let (next_doc_id, opencode_databases) = match &self.backend {
             Backend::Legacy(value) => {
                 let state: IngestState = serde_json::from_value(value.clone())?;
-                Ok(CheckpointHeader {
-                    next_doc_id: state.next_doc_id,
-                    opencode_databases: state.opencode_databases,
-                })
+                (state.next_doc_id, state.opencode_databases)
             }
             Backend::Sqlite { connection, .. } => {
                 let (next_id, databases): (String, String) = connection.query_row(
-                    "SELECT next_doc_id, opencode_databases FROM metadata WHERE singleton=1",
+                    "SELECT next_doc_id,opencode_databases FROM metadata WHERE singleton=1",
                     [],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
-                Ok(CheckpointHeader {
-                    next_doc_id: parse_next_id(&next_id)?,
-                    opencode_databases: serde_json::from_str(&databases)?,
-                })
+                (parse_next_id(&next_id)?, serde_json::from_str(&databases)?)
             }
-        }
+        };
+        Ok(CheckpointHeader {
+            next_doc_id,
+            opencode_databases,
+            pending: self
+                .export_pending_json()?
+                .map(serde_json::from_value)
+                .transpose()?,
+            scan_cache: self
+                .export_scan_cache_json()?
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default(),
+        })
+    }
+
+    pub(crate) fn export_pending_json(&self) -> Result<Option<Value>> {
+        let raw = match &self.backend {
+            Backend::Sqlite {
+                connection,
+                version: 2,
+                ..
+            } => connection
+                .query_row(
+                    "SELECT pending_json FROM metadata WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )?
+                .map(String::into_bytes),
+            _ => lifecycle::read_sidecar(&self.state_path, PENDING)?,
+        };
+        codec::pending_document(raw.as_deref())
+    }
+
+    pub(crate) fn export_scan_cache_json(&self) -> Result<Option<Value>> {
+        let raw = match &self.backend {
+            Backend::Sqlite {
+                connection,
+                version: 2,
+                ..
+            } => connection
+                .query_row(
+                    "SELECT CASE WHEN length(CAST(scancache_json AS BLOB)) <= ?1 THEN scancache_json END FROM metadata WHERE singleton=1",
+                    [ScanCache::MAX_JSON_BYTES],
+                    |row| row.get::<_, Option<String>>(0),
+                )?
+                .map(String::into_bytes),
+            _ => lifecycle::read_sidecar(&self.state_path, SCAN_CACHE)?,
+        };
+        Ok(codec::scan_cache_document(raw.as_deref()))
     }
 
     pub(crate) fn load_files(
@@ -268,12 +358,27 @@ impl CheckpointWriter {
         &self.reader
     }
 
+    pub(crate) fn commit_intent(&mut self, pending: &PendingIngest) -> Result<()> {
+        crate::profiling::span!("state.checkpoint.commit_intent");
+        let Backend::Sqlite { connection, .. } = &mut self.reader.backend else {
+            bail!("checkpoint writer is not SQLite");
+        };
+        let transaction = connection.transaction()?;
+        replace_pending(&transaction, &PendingChange::Replace(pending.clone()))?;
+        transaction.commit()?;
+        crate::profiling::count!("state.checkpoint.early_intent_writes", 1);
+        Ok(())
+    }
+
     pub(crate) fn commit_delta(&mut self, delta: &CheckpointDelta) -> Result<bool> {
+        crate::profiling::span!("state.checkpoint.commit_delta");
         if delta.upserts.is_empty()
             && delta.deletes.is_empty()
             && !delta.clear_files
             && delta.next_doc_id.is_none()
             && delta.opencode_databases.is_none()
+            && matches!(delta.pending, PendingChange::Keep)
+            && delta.scan_cache.is_none()
         {
             return Ok(false);
         }
@@ -320,6 +425,18 @@ impl CheckpointWriter {
                 [codec::database_payload(databases, &old)?],
             )?;
         }
+        replace_pending(&transaction, &delta.pending)?;
+        if let Some(cache) = &delta.scan_cache {
+            let old: Option<String> = transaction.query_row(
+                "SELECT CASE WHEN length(CAST(scancache_json AS BLOB)) <= ?1 THEN scancache_json END FROM metadata WHERE singleton=1",
+                [ScanCache::MAX_JSON_BYTES],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                "UPDATE metadata SET scancache_json=?1 WHERE singleton=1",
+                [codec::scan_cache_payload(cache, old.as_deref())?],
+            )?;
+        }
         transaction.commit()?;
         crate::profiling::count!("state.checkpoint.transactions", 1);
         crate::profiling::count!("state.checkpoint.rows_upserted", delta.upserts.len());
@@ -328,6 +445,7 @@ impl CheckpointWriter {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) fn checkpoint(&mut self) -> Result<()> {
         let Backend::Sqlite { connection, .. } = &self.reader.backend else {
             bail!("checkpoint writer is not SQLite");
@@ -351,6 +469,35 @@ impl CheckpointWriter {
     }
 }
 
+fn replace_pending(connection: &Connection, change: &PendingChange) -> Result<()> {
+    let payload = match change {
+        PendingChange::Keep => return Ok(()),
+        PendingChange::Clear => None,
+        PendingChange::Replace(pending) => {
+            let old: Option<String> = connection.query_row(
+                "SELECT pending_json FROM metadata WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?;
+            Some(codec::pending_payload(pending, old.as_deref())?)
+        }
+    };
+    connection.execute(
+        "UPDATE metadata SET pending_json=?1 WHERE singleton=1",
+        [payload],
+    )?;
+    Ok(())
+}
+
+pub(super) fn sidecar_reader(path: &Path) -> Result<Option<CheckpointReader>> {
+    let reader = CheckpointReader::open(&path.with_file_name("ingest.json"))?;
+    Ok(reader.is_v2().then_some(reader))
+}
+
+pub(super) fn save_sidecar(path: &Path, data: Option<&[u8]>) -> Result<()> {
+    lifecycle::save_sidecar(path, data)
+}
+
 pub(super) fn save_legacy(state: &IngestState, state_path: &Path) -> Result<()> {
     lifecycle::save_legacy(state, state_path)
 }
@@ -367,19 +514,15 @@ pub(crate) fn is_checkpoint_artifact_name(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
-    matches!(
-        name,
-        DATABASE
-            | "checkpoints.sqlite-wal"
-            | "checkpoints.sqlite-shm"
-            | "checkpoints.sqlite-journal"
-            | LOCK
-            | "ingest.json"
-    ) || name
-        .strip_prefix("ingest.legacy-")
-        .and_then(|suffix| suffix.strip_suffix(".json"))
-        .is_some_and(|digest| {
-            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    ACTIVE_ARTIFACTS.contains(&name)
+        || name == LOCK
+        || JSON_ARTIFACTS.iter().any(|artifact| {
+            let stem = artifact.trim_end_matches(".json");
+            name.strip_prefix(&format!("{stem}.legacy-"))
+                .and_then(|suffix| suffix.strip_suffix(".json"))
+                .is_some_and(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
         })
 }
 

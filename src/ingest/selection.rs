@@ -415,7 +415,7 @@ mod tests {
             crate::lease::IngestLease::acquire(&paths, "test", std::time::Duration::ZERO).unwrap();
         let path = paths.state.join("ingest.json");
         state.save_with_lease(&path, &lease).unwrap();
-        CheckpointSession::open(&path, &lease, false).unwrap()
+        CheckpointSession::open(&path, &lease, false, None).unwrap()
     }
     use crate::test_support::{EnvVarGuard, env_lock};
 

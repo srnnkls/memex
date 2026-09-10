@@ -98,7 +98,10 @@ fn directory_inventory_full_scan_persists_and_targeted_scan_preserves_cache() {
     #[cfg(target_os = "macos")]
     assert!(cache.directory_inventory.is_some());
     assert_eq!(cache.file_count, 1);
-    let before = fs::read(&cache_path).unwrap();
+    let before = CheckpointReader::open(&paths.state.join("ingest.json"))
+        .unwrap()
+        .export_scan_cache_json()
+        .unwrap();
     let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
     writeln!(
         file,
@@ -115,7 +118,13 @@ fn directory_inventory_full_scan_persists_and_targeted_scan_preserves_cache() {
     .unwrap();
     assert!(!report.full_scan);
     assert_eq!(report.report.records_added, 1);
-    assert_eq!(fs::read(&cache_path).unwrap(), before);
+    assert_eq!(
+        CheckpointReader::open(&paths.state.join("ingest.json"))
+            .unwrap()
+            .export_scan_cache_json()
+            .unwrap(),
+        before
+    );
     let report = ingest_if_stale(&paths, &open_search_index(&paths), &options, 0, &lease)
         .unwrap()
         .unwrap();

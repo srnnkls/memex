@@ -976,7 +976,7 @@ pub(super) fn prepare_refresh(
     if !full_scan {
         scan_cache = None;
     } else if scan_cache.is_none() {
-        scan_cache = Some(ScanCache::load(&paths.state.join("scan_cache.json"))?);
+        scan_cache = Some(std::mem::take(&mut state.scan_cache));
     }
     let mut inventory = scan_cache.as_mut().map(|cache| {
         crate::directory_inventory::DiscoveryInventory::new(
@@ -1250,17 +1250,13 @@ pub(super) fn prepare_refresh(
 }
 
 pub(super) fn can_skip_fresh_scan(
-    cache: &ScanCache,
+    header: &CheckpointHeader,
     paths: &Paths,
     index: &SearchIndex,
     options: &IngestOptions,
     ttl_seconds: u64,
 ) -> Result<bool> {
-    let pending_path = pending_ingest_path(paths);
-    if pending_path
-        .try_exists()
-        .with_context(|| format!("check pending ingest at {}", pending_path.display()))?
-    {
+    if header.pending.is_some() {
         return Ok(false);
     }
     if options.include_opencode {
@@ -1275,7 +1271,7 @@ pub(super) fn can_skip_fresh_scan(
     if index.doc_count()? == 0 {
         return Ok(false);
     }
-    if !cache.is_fresh(ttl_seconds) {
+    if !header.scan_cache.is_fresh(ttl_seconds) {
         return Ok(false);
     }
     let analytics = AnalyticsStore::open(analytics_path(&paths.state))?;
