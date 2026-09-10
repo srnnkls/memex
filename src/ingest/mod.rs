@@ -1,5 +1,6 @@
 mod checkpoint;
 use checkpoint::CheckpointSession;
+pub mod directories;
 mod execution;
 mod publication;
 use discovery::*;

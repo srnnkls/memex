@@ -1234,7 +1234,7 @@ fn scan_codex(
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
 ) -> Result<()> {
-    let files = crate::sources::codex::discover_rollouts()
+    let files = crate::sources::codex::discover_rollouts(None)
         .into_iter()
         .map(|file| file.path)
         .collect::<Vec<_>>();
@@ -1260,7 +1260,7 @@ fn scan_pi(
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
 ) -> Result<()> {
-    let files = crate::sources::pi::discover()
+    let files = crate::sources::pi::discover(None)
         .into_iter()
         .map(|file| file.path)
         .collect::<Vec<_>>();
@@ -1284,7 +1284,7 @@ fn scan_omp(
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
 ) -> Result<()> {
-    let files = crate::sources::omp::discover()
+    let files = crate::sources::omp::discover(None)
         .into_iter()
         .map(|file| file.path)
         .collect::<Vec<_>>();

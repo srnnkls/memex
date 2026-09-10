@@ -17,6 +17,7 @@ pub(super) fn discover_transcripts(
     state: &mut CheckpointSession,
     pool: &rayon::ThreadPool,
     selected: Option<&[crate::sources::SourceFile]>,
+    mut walk: Option<&mut directories::StampedWalk>,
 ) -> Result<TranscriptDiscovery> {
     let full_scan = selected.is_none();
     let mut files = selected.unwrap_or_default().to_vec();
@@ -25,11 +26,14 @@ pub(super) fn discover_transcripts(
             files.extend(crate::sources::claude::discover(
                 root,
                 options.include_agents,
+                walk.as_deref_mut(),
             )?);
         }
     }
     if options.include_codex && full_scan {
-        files.extend(crate::sources::codex::discover_rollouts());
+        files.extend(crate::sources::codex::discover_rollouts(
+            walk.as_deref_mut(),
+        ));
         files.extend(
             crate::sources::codex::history_paths()
                 .into_iter()
@@ -43,10 +47,10 @@ pub(super) fn discover_transcripts(
         files.extend(crate::sources::cursor::discover_transcripts());
     }
     if options.include_pi && full_scan {
-        files.extend(crate::sources::pi::discover());
+        files.extend(crate::sources::pi::discover(walk.as_deref_mut()));
     }
     if options.include_omp && full_scan {
-        files.extend(crate::sources::omp::discover());
+        files.extend(crate::sources::omp::discover(walk.as_deref_mut()));
     }
     if options.include_openclaw && full_scan {
         files.extend(crate::sources::openclaw::discover());
@@ -61,7 +65,7 @@ pub(super) fn discover_transcripts(
         files.extend(crate::sources::jcode::discover());
     }
     if options.include_muse && full_scan {
-        files.extend(crate::sources::muse::discover());
+        files.extend(crate::sources::muse::discover(walk));
     }
     if options.include_antigravity && full_scan {
         files.extend(crate::sources::antigravity::discover());
@@ -166,6 +170,48 @@ pub(super) fn discover_transcripts(
         }
     }
     Ok(result)
+}
+
+/// Directory stamps are only reusable while the roots and filters that produced them hold.
+fn discovery_fingerprint(options: &IngestOptions) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"memex-directory-stamps-v1");
+    let mut feed = |bytes: &[u8]| {
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    };
+    for root in &options.claude_sources {
+        feed(root.as_os_str().as_encoded_bytes());
+    }
+    for root in crate::sources::codex::rollout_roots() {
+        feed(root.as_os_str().as_encoded_bytes());
+    }
+    feed(
+        crate::sources::pi::sessions_root()
+            .as_os_str()
+            .as_encoded_bytes(),
+    );
+    for root in crate::sources::omp::session_roots() {
+        feed(root.as_os_str().as_encoded_bytes());
+    }
+    feed(
+        crate::sources::muse::sessions_root()
+            .as_os_str()
+            .as_encoded_bytes(),
+    );
+    for flag in [
+        options.include_agents,
+        options.include_codex,
+        options.include_pi,
+        options.include_omp,
+        options.include_muse,
+    ] {
+        feed(&[u8::from(flag)]);
+    }
+    for pattern in &options.exclude_patterns {
+        feed(pattern.as_bytes());
+    }
+    format!("{:x}", hash.finalize())
 }
 
 pub(super) fn modified_ns(metadata: &std::fs::Metadata) -> Option<i64> {
@@ -914,13 +960,42 @@ pub(super) fn prepare_refresh(
     } else if scan_cache.is_none() {
         scan_cache = Some(std::mem::take(&mut state.scan_cache));
     }
+    // Reuse reconstructs an unchanged directory from the rows the last successful refresh
+    // persisted. Session-level deletes (pending-intent recovery) and clears must not hide files
+    // that are still on disk, so they never feed the walk.
+    let mut walk = if full_scan {
+        let fingerprint = discovery_fingerprint(options);
+        let (previous, known) = if state.clears_files() {
+            (HashMap::new(), Vec::new())
+        } else {
+            (
+                state.load_directory_stamps(&fingerprint)?,
+                state.persisted_file_keys()?,
+            )
+        };
+        Some((
+            directories::StampedWalk::new(previous, known.into_iter().map(PathBuf::from)),
+            fingerprint,
+        ))
+    } else {
+        None
+    };
     let transcripts = discovery::discover_transcripts(
         options,
         &excluder,
         &mut state,
         pool,
         selected.as_ref().map(|(files, _)| files.as_slice()),
+        walk.as_mut().map(|(walk, _)| walk),
     )?;
+    if let Some((walk, fingerprint)) = walk {
+        crate::profiling::count!("discovery.directories_reused", walk.counters().reused);
+        crate::profiling::count!(
+            "discovery.directories_enumerated",
+            walk.counters().enumerated
+        );
+        state.directory_stamps = Some(walk.finish(fingerprint));
+    }
     tasks.extend(transcripts.tasks);
     unchanged_identities.extend(transcripts.unchanged_identities);
     files_scanned += transcripts.files_scanned;
