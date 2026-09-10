@@ -2609,11 +2609,12 @@ fn ensure_local_index(paths: &Paths, config: &UserConfig) -> Result<()> {
 }
 
 /// Search refreshes append without merging; once segments accumulate, one detached
-/// `memex index` process compacts them with the tiered policy and exits. Skipped while
-/// another ingest holds the lease, so at most one compaction runs at a time.
+/// `memex index compact` process folds the small ones into one segment and exits. Skipped
+/// while another ingest holds the lease, so at most one compaction runs at a time.
 fn schedule_compaction_if_fragmented(paths: &Paths) -> Result<()> {
-    let segments = SearchIndex::open_or_create(&paths.index)?.segment_count()?;
-    if segments <= crate::index::SEARCH_REFRESH_COMPACTION_SEGMENTS {
+    let small = SearchIndex::open_or_create(&paths.index)?
+        .small_segment_count(crate::index::COMPACTION_RETAINED_SEGMENTS)?;
+    if small <= crate::index::SEARCH_REFRESH_COMPACTION_SEGMENTS {
         return Ok(());
     }
     if !matches!(
@@ -2624,7 +2625,13 @@ fn schedule_compaction_if_fragmented(paths: &Paths) -> Result<()> {
     }
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command
-        .args(["--no-update-check", "--non-interactive", "index", "--root"])
+        .args([
+            "--no-update-check",
+            "--non-interactive",
+            "index",
+            "compact",
+            "--root",
+        ])
         .arg(&paths.root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

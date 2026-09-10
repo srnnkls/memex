@@ -240,6 +240,13 @@ EXAMPLES:
         #[command(flatten)]
         index: IndexArgs,
     },
+    /// Merge every searchable segment but the largest few into one
+    #[command(hide = true)]
+    IndexCompact {
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Reclaim unreachable immutable index generations without rebuilding
     #[command(hide = true)]
     IndexGc {
@@ -1336,6 +1343,9 @@ pub fn run() -> Result<()> {
         Commands::Reindex { index } => {
             run_index_args(&index, true)?;
         }
+        Commands::IndexCompact { root } => {
+            run_index_compact(root)?;
+        }
         Commands::IndexGc {
             root,
             dry_run,
@@ -2271,6 +2281,29 @@ fn remove_generated_path(path: &Path) -> Result<()> {
         std::fs::remove_file(path)
     };
     result.with_context(|| format!("remove reindex artifact {}", path.display()))
+}
+
+/// Search refreshes append without merging; this folds the accumulated small segments into
+/// one while leaving the largest untouched, so a compaction costs the small segments' size,
+/// not the corpus's.
+fn run_index_compact(root: Option<PathBuf>) -> Result<()> {
+    let paths = Paths::new(root)?;
+    let lease = IngestLease::acquire(&paths, "compaction", INGEST_LEASE_TIMEOUT)?;
+    if !SearchIndex::exists(&paths.index) {
+        println!("no index to compact");
+        return Ok(());
+    }
+    let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
+    let merged = index.compact_small_segments(crate::index::COMPACTION_RETAINED_SEGMENTS)?;
+    if merged > 0 {
+        index.publish_generation()?;
+    }
+    drop(lease);
+    println!(
+        "compacted {merged} segments; {} remain",
+        SearchIndex::open_or_create(&paths.index)?.segment_count()?
+    );
+    Ok(())
 }
 
 fn run_index_gc(root: Option<PathBuf>, dry_run: bool, offline: bool) -> Result<()> {

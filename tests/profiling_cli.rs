@@ -42,6 +42,23 @@ fn fixture() -> tempfile::TempDir {
     temp
 }
 
+fn run_compact(home: &Path, root: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_memex"))
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .args([
+            "--no-update-check",
+            "--non-interactive",
+            "index",
+            "compact",
+            "--root",
+        ])
+        .arg(root)
+        .output()
+        .unwrap()
+}
+
 fn run_index(home: &Path, root: &Path, rebuild: bool) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_memex"));
     command
@@ -93,8 +110,7 @@ fn explicit_incremental_indexing_preserves_segments_until_bulk_rebuild() {
         }
     }
     let mut seed_segments = Vec::new();
-    let mut previous_segments = Vec::new();
-    let mut compacted_peers = false;
+    let mut appended_segments = Vec::new();
     for append in 0..=10 {
         if append > 0 {
             let text = format!("privateneedle update-{append}");
@@ -124,8 +140,6 @@ fn explicit_incremental_indexing_preserves_segments_until_bulk_rebuild() {
             seed_segments = segments.clone();
         } else {
             assert!(seed_segments.iter().all(|id| segments.contains(id)));
-            compacted_peers |= segments.len() < previous_segments.len() + 1
-                && previous_segments.iter().any(|id| !segments.contains(id));
         }
         assert_eq!(index.doc_count().unwrap(), expected.len());
         assert_eq!(
@@ -137,9 +151,20 @@ fn explicit_incremental_indexing_preserves_segments_until_bulk_rebuild() {
                 .collect::<BTreeSet<_>>(),
             expected
         );
-        previous_segments = segments;
+        appended_segments = segments;
     }
-    assert!(compacted_peers, "tiny peer segments were never compacted");
+    // Compaction runs in a detached child, so drive it directly rather than racing it.
+    assert!(run_compact(temp.path(), &root).status.success());
+    let compacted = SearchIndex::open_or_create(&root.join("index"))
+        .unwrap()
+        .index
+        .searchable_segment_ids()
+        .unwrap();
+    assert!(
+        compacted.len() < appended_segments.len(),
+        "tiny peer segments were never compacted"
+    );
+    assert!(seed_segments.iter().all(|id| compacted.contains(id)));
     let current = fs::read(root.join("index/CURRENT")).unwrap();
     assert!(run_index(temp.path(), &root, false).status.success());
     assert_eq!(fs::read(root.join("index/CURRENT")).unwrap(), current);
@@ -153,7 +178,7 @@ fn explicit_incremental_indexing_preserves_segments_until_bulk_rebuild() {
     let rebuilt = SearchIndex::open_or_create(&root.join("index")).unwrap();
     let segments = rebuilt.index.searchable_segment_ids().unwrap();
     assert_eq!(segments.len(), 1);
-    assert!(segments.iter().all(|id| !previous_segments.contains(id)));
+    assert!(segments.iter().all(|id| !compacted.contains(id)));
     assert_eq!(rebuilt.doc_count().unwrap(), expected.len());
     assert_eq!(
         rebuilt

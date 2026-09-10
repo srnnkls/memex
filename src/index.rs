@@ -18,6 +18,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
+use tantivy::SegmentId;
 use tantivy::collector::{Collector, Count, SegmentCollector, TopDocs};
 use tantivy::columnar::StrColumn;
 use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
@@ -87,6 +88,11 @@ const SMALL_INGEST_MAX_BYTES: u64 = 1024 * 1024;
 const CONTINUOUS_MAX_SEGMENTS: usize = 4096;
 /// Segment count above which a search-triggered refresh schedules background compaction.
 pub const SEARCH_REFRESH_COMPACTION_SEGMENTS: usize = 8;
+/// Largest segments a background compaction leaves alone; everything smaller merges into one.
+pub const COMPACTION_RETAINED_SEGMENTS: usize = 3;
+/// A segment holding at least this share of the corpus is never folded by background
+/// compaction, so each compaction costs a bounded slice of the corpus, not a rewrite of it.
+const COMPACTION_SMALL_SEGMENT_SHARE: f64 = 0.05;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerationGcReport {
@@ -553,6 +559,42 @@ impl SearchIndex {
 
     pub fn segment_count(&self) -> Result<usize> {
         Ok(self.index.searchable_segment_metas()?.len())
+    }
+
+    /// Segments background compaction would fold: not among the `keep_largest` biggest and
+    /// below [`COMPACTION_SMALL_SEGMENT_SHARE`] of the corpus.
+    fn small_segment_ids(&self, keep_largest: usize) -> Result<Vec<SegmentId>> {
+        let mut segments = self.index.searchable_segment_metas()?;
+        segments.sort_by_key(|segment| std::cmp::Reverse(segment.num_docs()));
+        let total = segments
+            .iter()
+            .map(|segment| u64::from(segment.num_docs()))
+            .sum::<u64>();
+        let ceiling = (total as f64 * COMPACTION_SMALL_SEGMENT_SHARE) as u64;
+        Ok(segments
+            .iter()
+            .skip(keep_largest)
+            .filter(|segment| u64::from(segment.num_docs()) < ceiling.max(1))
+            .map(|segment| segment.id())
+            .collect())
+    }
+
+    pub fn small_segment_count(&self, keep_largest: usize) -> Result<usize> {
+        Ok(self.small_segment_ids(keep_largest)?.len())
+    }
+
+    /// Merge the small segments (see [`Self::small_segment_ids`]) into one segment. Returns
+    /// how many were merged; fewer than two candidates is a no-op.
+    pub fn compact_small_segments(&self, keep_largest: usize) -> Result<usize> {
+        let remainder = self.small_segment_ids(keep_largest)?;
+        if remainder.len() < 2 {
+            return Ok(0);
+        }
+        let mut writer: IndexWriter = self.index.writer_with_num_threads(1, 64_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        writer.merge(&remainder).wait()?;
+        writer.wait_merging_threads()?;
+        Ok(remainder.len())
     }
 
     fn open_or_create_for_ingest_with_merge_policy(
@@ -2748,6 +2790,31 @@ mod tests {
         writer.wait_merging_threads().unwrap();
         assert_eq!(index.segment_count().unwrap(), 6);
         assert!(index.segment_count().unwrap() < SEARCH_REFRESH_COMPACTION_SEGMENTS);
+    }
+
+    #[test]
+    fn compaction_folds_small_segments_and_keeps_the_largest() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create_for_search_refresh(temp.path()).unwrap();
+        let mut writer = index.writer_for_ingest(Some(1024)).unwrap();
+        for id in 0..40 {
+            index
+                .add_record(&mut writer, &test_record(id, "big"))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        for id in 40..46 {
+            index
+                .add_record(&mut writer, &test_record(id, "small"))
+                .unwrap();
+            writer.commit().unwrap();
+        }
+        writer.wait_merging_threads().unwrap();
+        assert_eq!(index.segment_count().unwrap(), 7);
+        assert_eq!(index.compact_small_segments(1).unwrap(), 6);
+        assert_eq!(index.segment_count().unwrap(), 2);
+        assert_eq!(index.doc_count().unwrap(), 46);
+        assert_eq!(index.compact_small_segments(1).unwrap(), 0);
     }
 
     #[test]
