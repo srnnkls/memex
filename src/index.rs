@@ -761,7 +761,7 @@ impl SearchIndex {
             );
         }
         pending.directory.seal_at(&final_dir)?;
-        sync_directory(&pending.index_root.join(GENERATIONS_DIR))?;
+        fsync_directory(&pending.index_root.join(GENERATIONS_DIR))?;
         atomic_write_current(&pending.index_root, &pending.generation_name)?;
         pending.published.store(true, AtomicOrdering::Release);
         prune_superseded_generations(&pending.index_root, &pending.generation_name)?;
@@ -2170,11 +2170,11 @@ fn validate_committed_generation(generation: &Path) -> Result<u64> {
 }
 
 fn create_generation_lease_file(generation: &Path) -> Result<()> {
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(generation.join(GENERATION_LEASE_FILE))?
-        .sync_all()?;
+        .open(generation.join(GENERATION_LEASE_FILE))?;
+    fsync_file(&file)?;
     Ok(())
 }
 
@@ -2192,7 +2192,7 @@ fn acquire_generation_lease(generation: &Path) -> Result<GenerationLease> {
 }
 
 fn prune_superseded_generations(index_root: &Path, current: &str) -> Result<()> {
-    prune_superseded_generations_with_sync(index_root, current, sync_directory)
+    prune_superseded_generations_with_sync(index_root, current, fsync_directory)
 }
 
 fn prune_superseded_generations_with_sync(
@@ -2273,7 +2273,7 @@ fn prune_superseded_generations_with_sync(
 }
 
 fn prune_legacy_index_files(index_root: &Path) -> Result<()> {
-    prune_legacy_index_files_with_sync(index_root, sync_directory)
+    prune_legacy_index_files_with_sync(index_root, fsync_directory)
 }
 
 fn prune_legacy_index_files_with_sync(
@@ -2349,8 +2349,9 @@ fn try_lock_generation_exclusive(_generation: &Path) -> Result<Option<File>> {
 fn atomic_write_current(index_root: &Path, generation_name: &str) -> Result<()> {
     let mut temp = tempfile::NamedTempFile::new_in(index_root)?;
     temp.write_all(format!("{generation_name}\n").as_bytes())?;
-    temp.as_file_mut().sync_all()?;
+    fsync_file(temp.as_file())?;
     temp.persist(index_root.join(CURRENT_FILE))?;
+    // The one drive-cache flush of publication: everything written before it lands with it.
     sync_directory(index_root)?;
     Ok(())
 }
@@ -2359,6 +2360,32 @@ fn atomic_write_current(index_root: &Path, generation_name: &str) -> Result<()> 
 fn sync_directory(dir: &Path) -> io::Result<()> {
     use std::fs::File;
     File::open(dir)?.sync_all()
+}
+
+/// Orders writes without a drive-cache flush; the next full sync makes them durable.
+#[cfg(unix)]
+fn fsync_directory(dir: &Path) -> io::Result<()> {
+    fsync_file(&File::open(dir)?)
+}
+
+#[cfg(unix)]
+fn fsync_file(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn fsync_directory(dir: &Path) -> io::Result<()> {
+    sync_directory(dir)
+}
+
+#[cfg(not(unix))]
+fn fsync_file(file: &File) -> io::Result<()> {
+    file.sync_all()
 }
 
 #[cfg(not(unix))]

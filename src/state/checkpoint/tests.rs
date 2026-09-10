@@ -195,8 +195,8 @@ fn every_writer_verifies_durable_sqlite_pragmas() {
         );
         for (name, expected) in [
             ("synchronous", 2),
-            ("fullfsync", 1),
-            ("checkpoint_fullfsync", 1),
+            ("fullfsync", 0),
+            ("checkpoint_fullfsync", 0),
             ("wal_autocheckpoint", 1000),
             ("journal_size_limit", 16 * 1024 * 1024),
         ] {

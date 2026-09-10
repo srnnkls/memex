@@ -182,8 +182,8 @@ fn open_connection(state_path: &Path, writable: bool, create: bool) -> Result<Co
 fn configure_writer(connection: &Connection) -> Result<()> {
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
-    connection.pragma_update(None, "fullfsync", true)?;
-    connection.pragma_update(None, "checkpoint_fullfsync", true)?;
+    connection.pragma_update(None, "fullfsync", false)?;
+    connection.pragma_update(None, "checkpoint_fullfsync", false)?;
     connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
     connection.pragma_update(None, "wal_autocheckpoint", 1000)?;
     connection.pragma_update(None, "journal_size_limit", 16 * 1024 * 1024)?;
@@ -194,8 +194,8 @@ fn configure_writer(connection: &Connection) -> Result<()> {
     );
     for (name, expected) in [
         ("synchronous", 2),
-        ("fullfsync", 1),
-        ("checkpoint_fullfsync", 1),
+        ("fullfsync", 0),
+        ("checkpoint_fullfsync", 0),
         ("wal_autocheckpoint", 1000),
         ("journal_size_limit", 16 * 1024 * 1024),
     ] {
