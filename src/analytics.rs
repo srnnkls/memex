@@ -205,7 +205,8 @@ impl AnalyticsStore {
         }
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS sessions_conversation_kind_idx ON sessions(conversation_kind);
-             CREATE INDEX IF NOT EXISTS sessions_label_idx ON sessions(label);",
+             CREATE INDEX IF NOT EXISTS sessions_label_idx ON sessions(label);
+             CREATE INDEX IF NOT EXISTS sessions_source_path_idx ON sessions(source_path);",
         )?;
         let previous_schema_version: Option<i64> = self
             .conn
