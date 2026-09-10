@@ -4,11 +4,10 @@
 > implements this spec with `--watch-mode events|poll` (`daemon run`,
 > `daemon enable/restart`, hidden on legacy `index --watch`).
 > Two findings from implementation are now part of the design:
-> (1) FSEvents defers content-modification events for files held open for
-> writing (0 events in 8s with the fd open, immediate delivery on close;
-> regression test `fsevents_defers_modify_until_close`) while agents stream
-> transcripts through a single held-open fd (confirmed via `lsof` on live
-> Codex sessions) — so macOS runs a 5s hot sweep re-statting recently
+> (1) FSEvents content notifications may arrive before or after a writer
+> closes its file. `fsevents_reports_content_change_before_or_after_close`
+> verifies eventual content-change delivery for the target path without
+> requiring close-time deferral. macOS retains a 5s hot sweep for recently
 > active files (`hot_sweep_dirty`, `HOT_SWEEP_INTERVAL`, `HOT_WINDOW`).
 > Candidates are selected from stored ingest timestamps before statting;
 > cold sessions resume through events or the periodic resync. Tracked
