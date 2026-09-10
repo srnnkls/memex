@@ -11,6 +11,9 @@ fn run_writer_fixture(
 }
 
 use super::*;
+
+#[path = "directory_tests.rs"]
+mod directory_tests;
 use crate::config::{IndexedToolContentLimits, Paths};
 use crate::embed::{EmbedRuntimeConfig, ModelChoice};
 use crate::index::SearchIndex;
@@ -1089,6 +1092,7 @@ fn fresh_scan_cache() -> ScanCache {
         last_scan_ts,
         file_count: 0,
         total_bytes: 0,
+        directory_inventory: None,
     }
 }
 
@@ -2471,6 +2475,7 @@ fn cannot_skip_fresh_scan_when_cache_is_stale() {
         last_scan_ts: 0,
         file_count: 0,
         total_bytes: 0,
+        directory_inventory: None,
     };
 
     assert!(!can_skip_fresh_scan(&cache, &paths, &index, &options, 60).unwrap());
@@ -2484,7 +2489,7 @@ fn updating_scan_cache_replaces_malformed_cache() {
     let cache_path = paths.state.join("scan_cache.json");
     fs::write(&cache_path, "{\"last_scan_ts\":").expect("seed malformed cache");
 
-    update_scan_cache(&paths, 7, 42).expect("update scan cache");
+    update_scan_cache(&paths, 7, 42, ScanCache::default()).expect("update scan cache");
 
     let cache = ScanCache::load(&cache_path).expect("load replaced cache");
     assert_eq!(cache.file_count, 7);
