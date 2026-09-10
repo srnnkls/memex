@@ -45,21 +45,110 @@ impl JournalReplay {
 
 pub const REPLAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// A replay normally answers in 6–25 ms. When a write anywhere on the volume is still in
+/// flight, fseventsd holds the answer for about 160 ms; past this budget a walk is cheaper.
+pub const REPLAY_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// A replay running on its own thread so the refresh can open its checkpoint and refresh
+/// memories meanwhile. The next cursor arrives as soon as it is captured, before any event is
+/// read, so it can be persisted even when the outcome is abandoned.
+pub struct ReplayHandle {
+    fingerprint: String,
+    streaming: std::sync::mpsc::Receiver<()>,
+    next: std::sync::mpsc::Receiver<Option<JournalCursor>>,
+    outcome: std::sync::mpsc::Receiver<Replay>,
+    started: std::time::Instant,
+}
+
+impl ReplayHandle {
+    /// `previous` loads the cursor stored under `fingerprint`; it runs on the replay thread.
+    pub fn spawn(
+        roots: Vec<PathBuf>,
+        fingerprint: String,
+        previous: impl FnOnce(&str) -> Option<JournalCursor> + Send + 'static,
+    ) -> Self {
+        let (streaming_tx, streaming) = std::sync::mpsc::channel();
+        let (next_tx, next) = std::sync::mpsc::channel();
+        let (outcome_tx, outcome) = std::sync::mpsc::channel();
+        let key = fingerprint.clone();
+        std::thread::Builder::new()
+            .name("memex-journal".into())
+            .spawn(move || {
+                let previous = previous(&key);
+                let replay = replay_with(
+                    &roots,
+                    previous.as_ref(),
+                    REPLAY_TIMEOUT,
+                    |next| {
+                        let _ = next_tx.send(next.cloned());
+                    },
+                    || {
+                        let _ = streaming_tx.send(());
+                    },
+                );
+                let _ = outcome_tx.send(replay.outcome);
+            })
+            .expect("spawn journal thread");
+        Self {
+            fingerprint,
+            streaming,
+            next,
+            outcome,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// Blocks until the stream is registered with fseventsd, or `limit` passes. A write issued
+    /// in the few milliseconds before registration makes fseventsd hold the replay for about
+    /// 160 ms; writes issued afterwards do not, so callers register first and write after.
+    pub fn wait_until_streaming(&self, limit: std::time::Duration) {
+        let _ = self.streaming.recv_timeout(limit);
+    }
+
+    /// Waits until `budget` after spawning for the outcome. The cursor arrives before any
+    /// event is read, so it is available even when the outcome is abandoned.
+    pub fn wait(self, budget: std::time::Duration) -> (String, JournalReplay) {
+        let deadline = self.started + budget;
+        // The cursor normally lands well before the budget, but the replay thread reaches it
+        // only after opening the checkpoint, so this waits against the same deadline as the
+        // outcome rather than blocking on that work.
+        let next = self
+            .next
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .unwrap_or(None);
+        let outcome = self
+            .outcome
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .unwrap_or(Replay::Unusable("replay budget exceeded"));
+        (self.fingerprint, JournalReplay { next, outcome })
+    }
+}
+
+pub fn replay(
+    roots: &[PathBuf],
+    previous: Option<&JournalCursor>,
+    timeout: std::time::Duration,
+) -> JournalReplay {
+    replay_with(roots, previous, timeout, |_| {}, || {})
+}
+
 /// Replay cost grows with every event the volume logged since the cursor, not only those under
 /// the roots: about 150 ms per million on an M1 Pro. Beyond this distance a walk is cheaper.
 pub const MAX_REPLAY_DISTANCE: u64 = 500_000;
 
 #[cfg(not(target_os = "macos"))]
-pub fn replay(
+fn replay_with(
     _roots: &[PathBuf],
     _previous: Option<&JournalCursor>,
     _timeout: std::time::Duration,
+    _captured: impl FnOnce(Option<&JournalCursor>),
+    _streaming: impl FnOnce(),
 ) -> JournalReplay {
     JournalReplay::unusable(None, "unsupported platform")
 }
 
 #[cfg(target_os = "macos")]
-pub use fsevents::replay;
+use fsevents::replay_with;
 
 #[cfg(target_os = "macos")]
 mod fsevents {
@@ -189,12 +278,25 @@ mod fsevents {
         value
     }
 
-    pub fn replay(
+    pub fn replay_with(
         roots: &[PathBuf],
         previous: Option<&JournalCursor>,
         timeout: Duration,
+        captured: impl FnOnce(Option<&JournalCursor>),
+        streaming: impl FnOnce(),
     ) -> JournalReplay {
         crate::profiling::span!("journal.replay");
+        replay_inner(roots, previous, timeout, captured, streaming)
+    }
+
+    fn replay_inner(
+        roots: &[PathBuf],
+        previous: Option<&JournalCursor>,
+        timeout: Duration,
+        captured: impl FnOnce(Option<&JournalCursor>),
+        streaming: impl FnOnce(),
+    ) -> JournalReplay {
+        let _streaming = Streaming(Some(streaming));
         let mut device = None;
         let mut watched = Vec::new();
         for root in roots {
@@ -204,6 +306,7 @@ mod fsevents {
             match device {
                 None => device = Some(metadata.dev()),
                 Some(seen) if seen != metadata.dev() => {
+                    captured(None);
                     return JournalReplay::unusable(None, "roots span devices");
                 }
                 Some(_) => {}
@@ -211,9 +314,11 @@ mod fsevents {
             watched.push(root.clone());
         }
         let Some(device) = device else {
+            captured(None);
             return JournalReplay::unusable(None, "no roots");
         };
         let Some(device_uuid) = device_uuid(device as libc::dev_t) else {
+            captured(None);
             return JournalReplay::unusable(None, "device without journal");
         };
         let event_id = unsafe { fse::FSEventsGetCurrentEventId() };
@@ -221,6 +326,7 @@ mod fsevents {
             device_uuid: device_uuid.clone(),
             event_id,
         });
+        captured(next.as_ref());
         let Some(previous) = previous else {
             return JournalReplay::unusable(next, "no cursor");
         };
@@ -246,7 +352,15 @@ mod fsevents {
             done: false,
             unusable: None,
         };
-        let outcome = unsafe { run_stream(&watched, previous.event_id, timeout, &mut collector) };
+        let outcome = unsafe {
+            run_stream(
+                &watched,
+                previous.event_id,
+                timeout,
+                &mut collector,
+                _streaming,
+            )
+        };
         crate::profiling::count!("journal.events", collector.events);
         JournalReplay {
             next,
@@ -261,11 +375,29 @@ mod fsevents {
         }
     }
 
+    /// Fires once, at the latest when dropped, so an early exit never leaves a waiter hanging.
+    struct Streaming<F: FnOnce()>(Option<F>);
+
+    impl<F: FnOnce()> Streaming<F> {
+        fn fire(&mut self) {
+            if let Some(callback) = self.0.take() {
+                callback();
+            }
+        }
+    }
+
+    impl<F: FnOnce()> Drop for Streaming<F> {
+        fn drop(&mut self) {
+            self.fire();
+        }
+    }
+
     unsafe fn run_stream(
         roots: &[PathBuf],
         since: fse::FSEventStreamEventId,
         timeout: Duration,
         collector: &mut Collector,
+        mut streaming: Streaming<impl FnOnce()>,
     ) -> Result<(), &'static str> {
         let array = unsafe {
             cf::CFArrayCreateMutable(cf::kCFAllocatorDefault, 0, &cf::kCFTypeArrayCallBacks)
@@ -310,6 +442,7 @@ mod fsevents {
             fse::FSEventStreamScheduleWithRunLoop(stream, run_loop, cf::kCFRunLoopDefaultMode)
         };
         let started = unsafe { fse::FSEventStreamStart(stream) } != 0;
+        streaming.fire();
         if started {
             let deadline = Instant::now() + timeout;
             while !collector.done && collector.unusable.is_none() {

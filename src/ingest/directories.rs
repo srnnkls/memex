@@ -147,6 +147,10 @@ impl StampedWalk {
             }
             self.counters.enumerated += 1;
             let Ok(entries) = fs::read_dir(&directory) else {
+                // The stamp of an ancestor certifies its own entries, not its descendants'.
+                // Leaving this directory unstamped while its parent stays reusable would
+                // hide it from every later refresh, so drop the parents' stamps too.
+                self.forget_ancestors(&directory);
                 continue;
             };
             let mut complete = true;
@@ -167,9 +171,23 @@ impl StampedWalk {
             }
             if complete {
                 self.next.insert(directory, stamp);
+            } else {
+                self.forget_ancestors(&directory);
             }
         }
         files
+    }
+
+    /// Removes every stamp on the path from a root down to `directory`, so a refresh that
+    /// could not enumerate it cannot be skipped through an ancestor next time.
+    fn forget_ancestors(&mut self, directory: &Path) {
+        let mut parent = directory.parent();
+        while let Some(path) = parent {
+            if self.next.remove(path).is_none() && !self.previous.contains_key(path) {
+                break;
+            }
+            parent = path.parent();
+        }
     }
 
     /// Rows to write with the refresh: stamps observed under the walked roots, and previous

@@ -219,20 +219,34 @@ fn discovery_fingerprint(options: &IngestOptions) -> String {
 /// transcript being appended right now may not be in the replay yet.
 pub(super) const JOURNAL_HOT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-/// Replay the file-system event journal since the cursor persisted by the last committed
-/// refresh. Returns the cursor to persist with this refresh and, when the journal was complete,
-/// the paths that may have changed. `None` hints mean the caller must walk.
-fn journal_hints(
+/// Start replaying the file-system event journal from the cursor persisted by the last
+/// committed refresh, on its own thread, before the checkpoint is opened.
+pub(crate) fn start_journal_replay(
+    paths: &Paths,
     options: &IngestOptions,
+) -> journal::ReplayHandle {
+    let roots = crate::watch::watch_roots(options);
+    let fingerprint = journal_fingerprint(options, &roots);
+    let state_path = paths.state.join("ingest.json");
+    journal::ReplayHandle::spawn(roots, fingerprint, move |fingerprint| {
+        CheckpointReader::open(&state_path)
+            .and_then(|reader| reader.load_journal_cursor(fingerprint))
+            .ok()
+            .flatten()
+    })
+}
+
+/// Collect the replay. Returns the cursor to persist with this refresh and, when the journal
+/// was complete within budget, the paths that may have changed. `None` hints mean the caller
+/// must walk.
+fn journal_hints(
+    journal: journal::ReplayHandle,
     state: &CheckpointSession,
 ) -> Result<(
     Option<journal::JournalCursorUpdate>,
     Option<HashSet<PathBuf>>,
 )> {
-    let roots = crate::watch::watch_roots(options);
-    let fingerprint = journal_fingerprint(options, &roots);
-    let previous = state.load_journal_cursor(&fingerprint)?;
-    let replay = journal::replay(&roots, previous.as_ref(), journal::REPLAY_TIMEOUT);
+    let (fingerprint, replay) = journal.wait(journal::REPLAY_BUDGET);
     let cursor = replay.next.map(|cursor| journal::JournalCursorUpdate {
         fingerprint,
         cursor,
@@ -960,15 +974,28 @@ pub(super) struct PreparedRefresh {
     pub identities_changed: bool,
 }
 
+/// How a refresh limits discovery: to event hints from a watcher, to a journal replay started
+/// before the checkpoint was opened, or not at all.
+pub(super) enum Narrowing<'a> {
+    Dirty(&'a HashSet<PathBuf>),
+    Journal(journal::ReplayHandle),
+    None,
+}
+
 pub(super) fn prepare_refresh(
     paths: &Paths,
     index: &SearchIndex,
     options: &IngestOptions,
     pool: &rayon::ThreadPool,
     recovered: publication::RecoveredCheckpoint,
-    dirty: Option<&HashSet<PathBuf>>,
+    narrowing: Narrowing<'_>,
     mut scan_cache: Option<ScanCache>,
 ) -> Result<PreparedRefresh> {
+    let (dirty, journal) = match narrowing {
+        Narrowing::Dirty(dirty) => (Some(dirty), None),
+        Narrowing::Journal(journal) => (None, Some(journal)),
+        Narrowing::None => (None, None),
+    };
     let publication::RecoveredCheckpoint {
         mut state,
         pending_recovery,
@@ -989,15 +1016,15 @@ pub(super) fn prepare_refresh(
         None
     };
     let mut journal_cursor = None;
-    let selected = match selected {
-        None if options.journal
-            && dirty.is_none()
-            && !recovering_pending_ingest
-            && !empty_index_rebuild
-            && state_path.exists()
-            && !state.clears_files() =>
+    let selected = match (selected, journal) {
+        (None, Some(journal))
+            if dirty.is_none()
+                && !recovering_pending_ingest
+                && !empty_index_rebuild
+                && state_path.exists()
+                && !state.clears_files() =>
         {
-            let (cursor, hints) = journal_hints(options, &state)?;
+            let (cursor, hints) = journal_hints(journal, &state)?;
             journal_cursor = cursor;
             match hints {
                 Some(hints) => match selection::resolve_dirty(options, &hints, &state)? {
@@ -1010,7 +1037,15 @@ pub(super) fn prepare_refresh(
                 None => None,
             }
         }
-        selected => selected,
+        (selected, Some(journal)) => {
+            // The hints cannot be used here, but the cursor was captured before anything was
+            // read, so it still describes what this refresh is about to cover. Dropping it
+            // would make the next refresh replay an interval this scan already handled.
+            let (cursor, _) = journal_hints(journal, &state)?;
+            journal_cursor = cursor;
+            selected
+        }
+        (selected, None) => selected,
     };
     let full_scan = selected.is_none();
     state.journal_cursor = journal_cursor;
@@ -1104,7 +1139,7 @@ pub(super) fn prepare_refresh(
                 pending_recovery,
                 empty_index_rebuild,
             },
-            None,
+            Narrowing::None,
             scan_cache,
         );
     };

@@ -60,13 +60,6 @@ impl CheckpointSession {
         self.writer.reader().load_directory_stamps(fingerprint)
     }
 
-    pub fn load_journal_cursor(
-        &self,
-        fingerprint: &str,
-    ) -> Result<Option<super::journal::JournalCursor>> {
-        self.writer.reader().load_journal_cursor(fingerprint)
-    }
-
     /// Paths the last committed checkpoint saw modified at or after `since` (Unix seconds).
     pub fn hot_file_keys(&self, since: i64) -> Result<Vec<String>> {
         Ok(self
