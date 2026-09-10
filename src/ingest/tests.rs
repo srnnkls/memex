@@ -42,6 +42,7 @@ fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
         model,
         embed_runtime: EmbedRuntimeConfig::default(),
         tool_content_limits: IndexedToolContentLimits::default(),
+        defer_merges: false,
     }
 }
 
@@ -923,6 +924,7 @@ fn cancelled_writer_does_not_publish_staged_records() {
     let ctx = WriterContext {
         index_root: PathBuf::new(),
         input_bytes: None,
+        defer_merges: false,
         embeddings: false,
         do_backfill_embeddings: false,
         reset_vector_store: false,
@@ -994,6 +996,7 @@ fn parser_cancellation_preserves_active_vectors() {
     let ctx = WriterContext {
         index_root: PathBuf::new(),
         input_bytes: None,
+        defer_merges: false,
         embeddings: true,
         do_backfill_embeddings: false,
         reset_vector_store: true,
@@ -2333,6 +2336,7 @@ fn ingest_claude_records_preserve_sidechain_and_tool_links() {
         model: ModelChoice::default(),
         embed_runtime: EmbedRuntimeConfig::default(),
         tool_content_limits: IndexedToolContentLimits::default(),
+        defer_merges: false,
     };
 
     let lease = ingest_lease(&paths);
@@ -2963,6 +2967,7 @@ fn ingest_pi_session_records_supported_message_shapes() {
         model: ModelChoice::default(),
         embed_runtime: EmbedRuntimeConfig::default(),
         tool_content_limits: IndexedToolContentLimits::default(),
+        defer_merges: false,
     };
 
     let lease = ingest_lease(&paths);
@@ -3382,6 +3387,7 @@ fn writer_loop_accepts_copilot_source_progress() {
     let ctx = WriterContext {
         index_root: PathBuf::new(),
         input_bytes: None,
+        defer_merges: false,
         embeddings: false,
         do_backfill_embeddings: false,
         reset_vector_store: false,

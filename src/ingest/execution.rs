@@ -899,15 +899,18 @@ pub(super) fn prehydrate_opencode_database(
         .tempfile_in(state_dir)
         .with_context(|| format!("create OpenCode hydration spool in {}", state_dir.display()))?;
     let mut diagnostics = crate::sources::ParseDiagnostics::default();
+    let connection = crate::sources::opencode::open_database_for_sessions(path)?;
+    let mut writer = std::io::BufWriter::new(spool.as_file_mut());
     for session_id in session_ids {
-        let output = crate::sources::opencode::parse_database_records(
+        let output = crate::sources::opencode::parse_session_records(
+            &connection,
             path,
             session_id,
             crate::sources::IndexParseState::default(),
             next_doc_id,
             |record| {
-                serde_json::to_writer(spool.as_file_mut(), &record)?;
-                spool.as_file_mut().write_all(b"\n")?;
+                serde_json::to_writer(&mut writer, &record)?;
+                writer.write_all(b"\n")?;
                 Ok(())
             },
         )
@@ -919,7 +922,8 @@ pub(super) fn prehydrate_opencode_database(
         })?;
         diagnostics.merge(output.diagnostics);
     }
-    spool.as_file_mut().flush()?;
+    writer.flush()?;
+    drop(writer);
     Ok(PreparedOpencodeDatabase {
         path: path.to_path_buf(),
         scan: scan.clone(),
@@ -1210,6 +1214,7 @@ pub(super) fn execute_refresh(
     let writer_ctx = WriterContext {
         index_root: paths.index.clone(),
         input_bytes,
+        defer_merges: options.defer_merges,
         embeddings,
         do_backfill_embeddings: options.backfill_embeddings
             || vector_migration.rebuild

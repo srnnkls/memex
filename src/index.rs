@@ -24,7 +24,7 @@ use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWrite
 use tantivy::directory::{
     Directory, DirectoryLock, FileHandle, Lock, MmapDirectory, WatchCallback, WatchHandle, WritePtr,
 };
-use tantivy::merge_policy::LogMergePolicy;
+use tantivy::merge_policy::{LogMergePolicy, NoMergePolicy};
 use tantivy::query::{AllQuery, BooleanQuery, EmptyQuery, Occur, Query, RangeQuery, TermQuery};
 use tantivy::schema::Value;
 use tantivy::schema::{
@@ -76,7 +76,8 @@ pub struct SearchIndex {
     pending_generation: Option<Arc<PendingGeneration>>,
     _generation_lease: Option<Arc<GenerationLease>>,
     incremental_merge_policy: bool,
-    sealed_reader: Arc<OnceLock<IndexReader>>,
+    defer_merges: bool,
+    shared_reader: Arc<OnceLock<IndexReader>>,
 }
 
 const GENERATIONS_DIR: &str = "generations";
@@ -84,6 +85,8 @@ const CURRENT_FILE: &str = "CURRENT";
 const GENERATION_LEASE_FILE: &str = ".lease";
 const SMALL_INGEST_MAX_BYTES: u64 = 1024 * 1024;
 const CONTINUOUS_MAX_SEGMENTS: usize = 4096;
+/// Segment count above which a search-triggered refresh schedules background compaction.
+pub const SEARCH_REFRESH_COMPACTION_SEGMENTS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerationGcReport {
@@ -539,6 +542,19 @@ impl SearchIndex {
         Self::open_or_create_for_ingest_with_merge_policy(dir, true)
     }
 
+    /// Search-triggered refreshes never merge in the foreground. Compaction runs in a
+    /// separate `memex index` process once the segment count passes
+    /// [`SEARCH_REFRESH_COMPACTION_SEGMENTS`].
+    pub fn open_or_create_for_search_refresh(dir: &Path) -> Result<Self> {
+        let mut index = Self::open_or_create_for_ingest_with_merge_policy(dir, true)?;
+        index.defer_merges = true;
+        Ok(index)
+    }
+
+    pub fn segment_count(&self) -> Result<usize> {
+        Ok(self.index.searchable_segment_metas()?.len())
+    }
+
     fn open_or_create_for_ingest_with_merge_policy(
         dir: &Path,
         incremental_merge_policy: bool,
@@ -606,7 +622,8 @@ impl SearchIndex {
             pending_generation: Some(pending),
             _generation_lease: None,
             incremental_merge_policy,
-            sealed_reader: Arc::new(OnceLock::new()),
+            defer_merges: false,
+            shared_reader: Arc::new(OnceLock::new()),
         })
     }
 
@@ -627,7 +644,8 @@ impl SearchIndex {
                 pending_generation: None,
                 _generation_lease: None,
                 incremental_merge_policy: false,
-                sealed_reader: Arc::new(OnceLock::new()),
+                defer_merges: false,
+                shared_reader: Arc::new(OnceLock::new()),
             })
         } else {
             create_index_in_dir(dir)
@@ -658,7 +676,9 @@ impl SearchIndex {
         } else {
             self.index.writer(256_000_000)?
         };
-        if self.incremental_merge_policy {
+        if self.defer_merges {
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+        } else if self.incremental_merge_policy {
             let mut policy = LogMergePolicy::default();
             policy.set_min_layer_size(1);
             writer.set_merge_policy(Box::new(policy));
@@ -666,12 +686,14 @@ impl SearchIndex {
         Ok(writer)
     }
 
-    /// Sealed generations are immutable, so one reader serves every read of this instance.
-    /// Writable instances open a fresh reader each time so commits become visible.
+    /// One reader per instance. Sealed generations never change; writable instances reload
+    /// the shared reader so committed segments become visible without reopening every file.
     pub fn reader(&self) -> Result<IndexReader> {
-        if !self.writable
-            && let Some(reader) = self.sealed_reader.get()
-        {
+        if let Some(reader) = self.shared_reader.get() {
+            if self.writable {
+                crate::profiling::span!("lexical.reader_reload");
+                reader.reload()?;
+            }
             return Ok(reader.clone());
         }
         crate::profiling::span!("lexical.reader_open");
@@ -681,9 +703,7 @@ impl SearchIndex {
             .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
         crate::profiling::count!("lexical.readers_opened", 1);
-        if !self.writable {
-            let _ = self.sealed_reader.set(reader.clone());
-        }
+        let _ = self.shared_reader.set(reader.clone());
         Ok(reader)
     }
 
@@ -1983,7 +2003,8 @@ fn create_index_in_dir(dir: &Path) -> Result<SearchIndex> {
         pending_generation: None,
         _generation_lease: None,
         incremental_merge_policy: false,
-        sealed_reader: Arc::new(OnceLock::new()),
+        defer_merges: false,
+        shared_reader: Arc::new(OnceLock::new()),
     })
 }
 
@@ -2013,7 +2034,8 @@ fn open_sealed_generation(dir: &Path) -> Result<SearchIndex> {
         pending_generation: None,
         _generation_lease: Some(generation_lease),
         incremental_merge_policy: false,
-        sealed_reader: Arc::new(OnceLock::new()),
+        defer_merges: false,
+        shared_reader: Arc::new(OnceLock::new()),
     })
 }
 
@@ -2682,6 +2704,23 @@ mod tests {
         writer.wait_merging_threads().unwrap();
         assert_eq!(index.index.searchable_segment_metas().unwrap().len(), 1);
         assert_eq!(index.doc_count().unwrap(), 32);
+    }
+
+    #[test]
+    fn search_refresh_never_merges_and_the_shared_reader_sees_each_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create_for_search_refresh(temp.path()).unwrap();
+        let mut writer = index.writer_for_ingest(Some(1024)).unwrap();
+        for id in 0..12 {
+            index
+                .add_record(&mut writer, &test_record(id, "deferred"))
+                .unwrap();
+            writer.commit().unwrap();
+            assert_eq!(index.doc_count().unwrap(), id as usize + 1);
+        }
+        writer.wait_merging_threads().unwrap();
+        assert_eq!(index.segment_count().unwrap(), 12);
+        assert!(index.segment_count().unwrap() < SEARCH_REFRESH_COMPACTION_SEGMENTS);
     }
 
     #[test]

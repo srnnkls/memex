@@ -39,6 +39,8 @@ pub(super) fn writer_loop(
     }
     let index = if index.is_writable() {
         index
+    } else if ctx.defer_merges {
+        SearchIndex::open_or_create_for_search_refresh(&ctx.index_root)?
     } else {
         SearchIndex::open_or_create_for_continuous_ingest(&ctx.index_root)?
     };
@@ -48,6 +50,7 @@ pub(super) fn writer_loop(
     let WriterContext {
         index_root: _,
         input_bytes: _,
+        defer_merges: _,
         embeddings,
         do_backfill_embeddings,
         reset_vector_store,
