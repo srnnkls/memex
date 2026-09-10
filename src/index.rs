@@ -22,7 +22,7 @@ use tantivy::merge_policy::NoMergePolicy;
 use tantivy::query::{AllQuery, BooleanQuery, EmptyQuery, Occur, Query, RangeQuery, TermQuery};
 use tantivy::schema::Value;
 use tantivy::schema::{
-    FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT,
+    FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder,
     TextFieldIndexing, TextOptions,
 };
 use tantivy::store::StoreReader;
@@ -2278,8 +2278,11 @@ fn build_schema_with_options(
     builder.add_text_field("text", text_options);
 
     builder.add_text_field("tool_name", STRING | STORED);
-    builder.add_text_field("tool_input", TEXT | STORED);
-    builder.add_text_field("tool_output", TEXT | STORED);
+    // Queries only parse against `text`, which already carries a tool result's content;
+    // indexing these too roughly doubled each segment's vocabulary. Existing indexes keep
+    // their on-disk schema until `memex index rebuild`.
+    builder.add_text_field("tool_input", STORED);
+    builder.add_text_field("tool_output", STORED);
     builder.add_text_field("event_id", STRING | STORED);
     builder.add_text_field("parent_event_id", STRING | STORED);
     builder.add_text_field("logical_parent_event_id", STRING | STORED);
@@ -2535,6 +2538,7 @@ fn add_optional_text(doc: &mut TantivyDocument, field: Field, value: &Option<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tantivy::schema::TEXT;
 
     fn test_record(doc_id: u64, text: &str) -> Record {
         Record {
