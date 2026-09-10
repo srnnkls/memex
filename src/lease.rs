@@ -69,6 +69,37 @@ impl Drop for IngestLease {
     }
 }
 
+/// Serializes the merge itself, which the ingest lease cannot: a compaction releases that
+/// lease while it merges so searches keep working, which would otherwise let two detached
+/// children merge the same segments at once.
+#[derive(Debug)]
+pub struct CompactionLock {
+    _file: File,
+}
+
+impl CompactionLock {
+    pub fn try_acquire(paths: &Paths) -> Result<Option<Self>> {
+        let path = compaction_lock_path(paths);
+        let file = open_lease_file(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(error)
+                .with_context(|| format!("failed to acquire compaction lock {}", path.display())),
+        }
+    }
+}
+
+fn compaction_lock_path(paths: &Paths) -> PathBuf {
+    let path = lease_path(paths);
+    path.with_file_name(
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(".memex.ingest.lock")
+            .replace("ingest.lock", "compaction.lock"),
+    )
+}
+
 fn lease_path(paths: &Paths) -> PathBuf {
     let parent = paths.root.parent().unwrap_or_else(|| Path::new("."));
     let root_name = paths

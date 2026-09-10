@@ -2286,19 +2286,41 @@ fn remove_generated_path(path: &Path) -> Result<()> {
 /// Search refreshes append without merging; this folds the accumulated small segments into
 /// one while leaving the largest untouched, so a compaction costs the small segments' size,
 /// not the corpus's.
+///
+/// The ingest lease is held only to stage from the current generation and to publish; the
+/// merge itself runs unleased so search refreshes never wait on it. Publication is skipped
+/// when another writer published in between, leaving the next compaction to fold again.
 fn run_index_compact(root: Option<PathBuf>) -> Result<()> {
     let paths = Paths::new(root)?;
-    let lease = IngestLease::acquire(&paths, "compaction", INGEST_LEASE_TIMEOUT)?;
     if !SearchIndex::exists(&paths.index) {
         println!("no index to compact");
         return Ok(());
     }
-    let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
+    // The merge below runs without the ingest lease so searches keep working, so the lease
+    // cannot keep two compactions apart. This can.
+    let Some(_compaction) = crate::lease::CompactionLock::try_acquire(&paths)? else {
+        println!("compaction already running");
+        return Ok(());
+    };
+    let (index, base) = {
+        let _lease = IngestLease::acquire(&paths, "compaction", INGEST_LEASE_TIMEOUT)?;
+        let base = SearchIndex::open_or_create(&paths.index)?
+            .snapshot_version()
+            .to_string();
+        (SearchIndex::open_or_create_for_ingest(&paths.index)?, base)
+    };
     let merged = index.compact_small_segments(crate::index::COMPACTION_RETAINED_SEGMENTS)?;
     if merged > 0 {
+        let _lease = IngestLease::acquire(&paths, "compaction", INGEST_LEASE_TIMEOUT)?;
+        let current = SearchIndex::open_or_create(&paths.index)?
+            .snapshot_version()
+            .to_string();
+        if current != base {
+            println!("compaction skipped: the index moved while merging");
+            return Ok(());
+        }
         index.publish_generation()?;
     }
-    drop(lease);
     println!(
         "compacted {merged} segments; {} remain",
         SearchIndex::open_or_create(&paths.index)?.segment_count()?
