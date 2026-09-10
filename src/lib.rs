@@ -1,7 +1,6 @@
 pub mod analytics;
 pub mod cli;
 pub mod config;
-mod directory_inventory;
 pub mod embed;
 pub mod herdr;
 pub mod index;

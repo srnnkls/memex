@@ -731,7 +731,9 @@ fn pending() -> PendingIngest {
             source_path: "source".into(),
             session_id: "session".into(),
         }],
+        vector_delete_paths: Vec::new(),
         vector_publication: true,
+        embedding_publication: Some(true),
     }
 }
 
@@ -740,7 +742,6 @@ fn cache() -> ScanCache {
         last_scan_ts: 17,
         file_count: 3,
         total_bytes: u64::MAX,
-        directory_inventory: None,
     }
 }
 
@@ -750,14 +751,6 @@ fn extended_sidecars(path: &Path) -> (Value, Value) {
     pending["session_scopes"][0]["extension"] = serde_json::json!({"owner":"session"});
     let mut cache = serde_json::to_value(cache()).unwrap();
     cache["extension"] = serde_json::json!([u64::MAX, "cache"]);
-    cache["directory_inventory"] = serde_json::json!({
-        "version": 1,
-        "projection": [1, 2, 3],
-        "epoch": {"boot": vec![0; 32], "mounts": 1},
-        "observed": {"seconds": 1, "nanos": 1},
-        "directories": [],
-        "children": []
-    });
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     for (name, value) in [(PENDING, &pending), (SCAN_CACHE, &cache)] {
         fs::write(
@@ -846,25 +839,8 @@ fn direct_legacy_and_v1_upgrade_import_all_documents_and_archive_raw_sidecars() 
             reader.header().unwrap().pending,
             Some(serde_json::from_value(pending.clone()).unwrap())
         );
-        assert!(
-            reader
-                .header()
-                .unwrap()
-                .scan_cache
-                .directory_inventory
-                .is_some()
-        );
         drop(reader);
         let writer = CheckpointWriter::open(&path, &lease, false).unwrap();
-        assert!(
-            writer
-                .reader()
-                .header()
-                .unwrap()
-                .scan_cache
-                .directory_inventory
-                .is_some()
-        );
         assert_eq!(writer.reader().export_json().unwrap(), original);
         assert_eq!(
             writer.reader().export_pending_json().unwrap(),
@@ -1212,10 +1188,6 @@ fn reordered_pending_scopes_keep_extensions_by_identity_and_cache_updates_keep_u
         writer.reader().export_scan_cache_json().unwrap().unwrap()["extension"],
         original_cache["extension"]
     );
-    assert_eq!(
-        writer.reader().export_scan_cache_json().unwrap().unwrap()["directory_inventory"],
-        Value::Null
-    );
 }
 
 #[test]
@@ -1454,7 +1426,6 @@ fn optional_scan_cache_oversize_does_not_block_checkpoint_open() {
     let header = reader.header().unwrap();
     assert_eq!(header.next_doc_id, 19);
     assert_eq!(header.scan_cache.last_scan_ts, 0);
-    assert!(header.scan_cache.directory_inventory.is_none());
     assert_eq!(reader.export_scan_cache_json().unwrap(), None);
     assert_eq!(
         ScanCache::load(&path.with_file_name(SCAN_CACHE))

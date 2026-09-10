@@ -9,6 +9,9 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 
+/// Full scans request nearly every row; one table scan beats thousands of point lookups.
+const BULK_LOAD_THRESHOLD: usize = 64;
+
 mod codec;
 mod lifecycle;
 #[cfg(test)]
@@ -187,7 +190,24 @@ impl CheckpointReader {
             }
             Backend::Sqlite { connection, .. } => {
                 let transaction = connection.unchecked_transaction()?;
-                {
+                if paths.len() >= BULK_LOAD_THRESHOLD {
+                    let wanted = paths.iter().map(String::as_str).collect::<HashSet<_>>();
+                    let mut statement =
+                        transaction.prepare_cached("SELECT path, payload FROM files")?;
+                    let mut rows = statement.query([])?;
+                    while let Some(row) = rows.next()? {
+                        let path: String = row.get(0)?;
+                        if !wanted.contains(path.as_str()) {
+                            continue;
+                        }
+                        let payload: String = row.get(1)?;
+                        crate::profiling::count!("state.checkpoint.rows_decoded", 1);
+                        result.insert(path, Some(serde_json::from_str(&payload)?));
+                    }
+                    for path in paths {
+                        result.entry(path.clone()).or_insert(None);
+                    }
+                } else {
                     let mut statement =
                         transaction.prepare_cached("SELECT payload FROM files WHERE path=?1")?;
                     for path in paths {

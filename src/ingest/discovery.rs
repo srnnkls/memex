@@ -17,25 +17,19 @@ pub(super) fn discover_transcripts(
     state: &mut CheckpointSession,
     pool: &rayon::ThreadPool,
     selected: Option<&[crate::sources::SourceFile]>,
-    mut inventory: Option<&mut crate::directory_inventory::DiscoveryInventory>,
 ) -> Result<TranscriptDiscovery> {
     let full_scan = selected.is_none();
     let mut files = selected.unwrap_or_default().to_vec();
     for root in options.claude_sources.iter().filter(|_| full_scan) {
-        files.extend(match inventory.as_deref_mut() {
-            Some(inventory) => crate::sources::claude::discover_with_inventory(
+        if root.exists() {
+            files.extend(crate::sources::claude::discover(
                 root,
                 options.include_agents,
-                inventory,
-            )?,
-            None => crate::sources::claude::discover(root, options.include_agents)?,
-        });
+            )?);
+        }
     }
     if options.include_codex && full_scan {
-        files.extend(match inventory.as_deref_mut() {
-            Some(inventory) => crate::sources::codex::discover_rollouts_with_inventory(inventory)?,
-            None => crate::sources::codex::discover_rollouts(),
-        });
+        files.extend(crate::sources::codex::discover_rollouts());
         files.extend(
             crate::sources::codex::history_paths()
                 .into_iter()
@@ -49,16 +43,10 @@ pub(super) fn discover_transcripts(
         files.extend(crate::sources::cursor::discover_transcripts());
     }
     if options.include_pi && full_scan {
-        files.extend(match inventory.as_deref_mut() {
-            Some(inventory) => crate::sources::pi::discover_with_inventory(inventory)?,
-            None => crate::sources::pi::discover(),
-        });
+        files.extend(crate::sources::pi::discover());
     }
     if options.include_omp && full_scan {
-        files.extend(match inventory {
-            Some(inventory) => crate::sources::omp::discover_with_inventory(inventory)?,
-            None => crate::sources::omp::discover(),
-        });
+        files.extend(crate::sources::omp::discover());
     }
     if options.include_openclaw && full_scan {
         files.extend(crate::sources::openclaw::discover());
@@ -840,58 +828,6 @@ pub(crate) fn build_path_excluder(options: &IngestOptions) -> Result<PathExclude
     PathExcluder::build(&expanded)
 }
 
-pub(super) fn directory_projection(options: &IngestOptions) -> Vec<u8> {
-    let roots = [
-        options.claude_sources.clone(),
-        if options.include_codex {
-            crate::sources::codex::rollout_roots()
-        } else {
-            Vec::new()
-        },
-        if options.include_pi {
-            vec![crate::sources::pi::sessions_root()]
-        } else {
-            Vec::new()
-        },
-        if options.include_omp {
-            crate::sources::omp::session_roots()
-        } else {
-            Vec::new()
-        },
-    ];
-    let mut hash = Sha256::new();
-    hash.update(b"memex-directory-discovery-v1");
-    for enabled in [
-        options.include_agents,
-        options.include_reasoning,
-        options.include_codex,
-        options.include_opencode,
-        options.include_cursor,
-        options.include_pi,
-        options.include_omp,
-        options.include_openclaw,
-        options.include_copilot,
-        options.include_grok,
-        options.include_jcode,
-        options.include_muse,
-    ] {
-        hash.update([u8::from(enabled)]);
-    }
-    for roots in roots {
-        hash.update((roots.len() as u64).to_le_bytes());
-        for root in roots {
-            let bytes = root.as_os_str().as_encoded_bytes();
-            hash.update((bytes.len() as u64).to_le_bytes());
-            hash.update(bytes);
-        }
-    }
-    for pattern in crate::config::expand_exclude_patterns(options.exclude_patterns.clone()) {
-        hash.update((pattern.len() as u64).to_le_bytes());
-        hash.update(pattern.as_bytes());
-    }
-    hash.finalize().to_vec()
-}
-
 pub(super) struct PreparedRefresh {
     pub full_scan: bool,
     pub scan_cache: Option<ScanCache>,
@@ -978,39 +914,13 @@ pub(super) fn prepare_refresh(
     } else if scan_cache.is_none() {
         scan_cache = Some(std::mem::take(&mut state.scan_cache));
     }
-    let mut inventory = scan_cache.as_mut().map(|cache| {
-        crate::directory_inventory::DiscoveryInventory::new(
-            cache.directory_inventory.take(),
-            &directory_projection(options),
-        )
-    });
     let transcripts = discovery::discover_transcripts(
         options,
         &excluder,
         &mut state,
         pool,
         selected.as_ref().map(|(files, _)| files.as_slice()),
-        inventory.as_mut(),
     )?;
-    #[cfg(feature = "profiling")]
-    if let Some(inventory) = &inventory {
-        let counters = inventory.counters();
-        crate::profiling::count!(
-            "discovery.directories_checked",
-            counters.directories_checked
-        );
-        crate::profiling::count!("discovery.directories_reused", counters.directories_reused);
-        crate::profiling::count!(
-            "discovery.directories_enumerated",
-            counters.directories_enumerated
-        );
-        crate::profiling::count!("discovery.fallback_walks", counters.fallback_walks);
-        crate::profiling::count!("discovery.metadata_checks", counters.metadata_checks);
-    }
-    if let Some(cache) = scan_cache.as_mut() {
-        cache.directory_inventory =
-            inventory.and_then(crate::directory_inventory::DiscoveryInventory::finish);
-    }
     tasks.extend(transcripts.tasks);
     unchanged_identities.extend(transcripts.unchanged_identities);
     files_scanned += transcripts.files_scanned;

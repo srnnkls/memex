@@ -16,8 +16,8 @@ use std::io::{self, Write};
 use std::ops::Bound;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, OnceLock};
 use tantivy::collector::{Collector, Count, SegmentCollector, TopDocs};
 use tantivy::columnar::StrColumn;
 use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
@@ -76,6 +76,7 @@ pub struct SearchIndex {
     pending_generation: Option<Arc<PendingGeneration>>,
     _generation_lease: Option<Arc<GenerationLease>>,
     incremental_merge_policy: bool,
+    sealed_reader: Arc<OnceLock<IndexReader>>,
 }
 
 const GENERATIONS_DIR: &str = "generations";
@@ -605,6 +606,7 @@ impl SearchIndex {
             pending_generation: Some(pending),
             _generation_lease: None,
             incremental_merge_policy,
+            sealed_reader: Arc::new(OnceLock::new()),
         })
     }
 
@@ -625,6 +627,7 @@ impl SearchIndex {
                 pending_generation: None,
                 _generation_lease: None,
                 incremental_merge_policy: false,
+                sealed_reader: Arc::new(OnceLock::new()),
             })
         } else {
             create_index_in_dir(dir)
@@ -663,7 +666,14 @@ impl SearchIndex {
         Ok(writer)
     }
 
+    /// Sealed generations are immutable, so one reader serves every read of this instance.
+    /// Writable instances open a fresh reader each time so commits become visible.
     pub fn reader(&self) -> Result<IndexReader> {
+        if !self.writable
+            && let Some(reader) = self.sealed_reader.get()
+        {
+            return Ok(reader.clone());
+        }
         crate::profiling::span!("lexical.reader_open");
         let reader: IndexReader = self
             .index
@@ -671,6 +681,9 @@ impl SearchIndex {
             .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
         crate::profiling::count!("lexical.readers_opened", 1);
+        if !self.writable {
+            let _ = self.sealed_reader.set(reader.clone());
+        }
         Ok(reader)
     }
 
@@ -1970,6 +1983,7 @@ fn create_index_in_dir(dir: &Path) -> Result<SearchIndex> {
         pending_generation: None,
         _generation_lease: None,
         incremental_merge_policy: false,
+        sealed_reader: Arc::new(OnceLock::new()),
     })
 }
 
@@ -1999,6 +2013,7 @@ fn open_sealed_generation(dir: &Path) -> Result<SearchIndex> {
         pending_generation: None,
         _generation_lease: Some(generation_lease),
         incremental_merge_policy: false,
+        sealed_reader: Arc::new(OnceLock::new()),
     })
 }
 

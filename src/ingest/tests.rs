@@ -11,9 +11,6 @@ fn run_writer_fixture(
 }
 
 use super::*;
-
-#[path = "directory_tests.rs"]
-mod directory_tests;
 use crate::config::{IndexedToolContentLimits, Paths};
 use crate::embed::{EmbedRuntimeConfig, ModelChoice};
 use crate::index::SearchIndex;
@@ -1116,7 +1113,6 @@ fn fresh_scan_cache() -> ScanCache {
         last_scan_ts,
         file_count: 0,
         total_bytes: 0,
-        directory_inventory: None,
     }
 }
 
@@ -1190,7 +1186,9 @@ fn no_publish_refresh_retains_deferred_scopes_and_updates_cache_atomically() {
         next_doc_id: 50,
         source_paths: Vec::new(),
         session_scopes: vec![second.clone(), first.clone(), second.clone()],
+        vector_delete_paths: Vec::new(),
         vector_publication: false,
+        embedding_publication: Some(false),
     }
     .save_with_lease(&pending_ingest_path(&paths), &lease)
     .unwrap();
@@ -1212,7 +1210,9 @@ fn no_publish_refresh_retains_deferred_scopes_and_updates_cache_atomically() {
             next_doc_id: 50,
             source_paths: Vec::new(),
             session_scopes: vec![first, second],
+            vector_delete_paths: Vec::new(),
             vector_publication: false,
+            embedding_publication: Some(false),
         })
     );
     assert!(!pending_ingest_path(&paths).exists());
@@ -1240,6 +1240,7 @@ fn pending_session_scopes_retain_database_state_for_recovery() {
             ..Default::default()
         },
     );
+    let lease = ingest_lease(&paths);
     PendingIngest {
         next_doc_id: 1,
         source_paths: Vec::new(),
@@ -1248,16 +1249,15 @@ fn pending_session_scopes_retain_database_state_for_recovery() {
         vector_publication: false,
         embedding_publication: Some(false),
     }
-    .save(&pending_ingest_path(&paths))
+    .save_with_lease(&pending_ingest_path(&paths), &lease)
     .unwrap();
-    let lease = ingest_lease(&paths);
     let state_path = paths.state.join("ingest.json");
     state.save_with_lease(&state_path, &lease).unwrap();
     let mut state = CheckpointSession::open(&state_path, &lease, false, None).unwrap();
     prepare_pending_ingest_recovery(&mut state).expect("pending recovery");
     assert!(state.opencode_databases.contains_key(&database_path));
 
-    PendingIngest::clear(&pending_ingest_path(&paths)).unwrap();
+    PendingIngest::clear_with_lease(&pending_ingest_path(&paths), &lease).unwrap();
     PendingIngest {
         next_doc_id: 1,
         source_paths: vec![database_path.clone()],
@@ -1266,17 +1266,17 @@ fn pending_session_scopes_retain_database_state_for_recovery() {
         vector_publication: false,
         embedding_publication: Some(false),
     }
-    .save(&pending_ingest_path(&paths))
+    .save_with_lease(&pending_ingest_path(&paths), &lease)
     .unwrap();
-    prepare_pending_ingest_recovery(&paths, &mut state)
-        .unwrap()
-        .expect("full-path pending recovery");
+    prepare_pending_ingest_recovery(&mut state).expect("full-path pending recovery");
     state
         .commit_intent(&PendingIngest {
             next_doc_id: 1,
             source_paths: vec![database_path.clone()],
             session_scopes: Vec::new(),
+            vector_delete_paths: Vec::new(),
             vector_publication: false,
+            embedding_publication: Some(false),
         })
         .unwrap();
     prepare_pending_ingest_recovery(&mut state).expect("full-path pending recovery");
@@ -2560,7 +2560,9 @@ fn freshness_uses_sqlite_pending_and_cache_without_sidecars() {
         next_doc_id: 2,
         source_paths: vec![transcript.to_string_lossy().into_owned()],
         session_scopes: Vec::new(),
+        vector_delete_paths: Vec::new(),
         vector_publication: false,
+        embedding_publication: Some(false),
     }
     .save_with_lease(&pending_path, &lease)
     .unwrap();
@@ -2642,7 +2644,9 @@ fn freshness_reads_legacy_and_sql_v1_sidecars_without_upgrade() {
             next_doc_id: 2,
             source_paths: vec!["source-1.jsonl".to_string()],
             session_scopes: Vec::new(),
+            vector_delete_paths: Vec::new(),
             vector_publication: false,
+            embedding_publication: Some(false),
         }
         .save(&pending_path)
         .unwrap();
@@ -2699,7 +2703,6 @@ fn cannot_skip_fresh_scan_when_cache_is_stale() {
         last_scan_ts: 0,
         file_count: 0,
         total_bytes: 0,
-        directory_inventory: None,
     };
 
     cache.save(&paths.state.join("scan_cache.json")).unwrap();
@@ -4228,11 +4231,12 @@ fn cleanup_only_vector_recovery_reconciles_orphans_without_deletion_targets() {
     vectors.add(99, &[0.0; 4]).unwrap();
     vectors.save().unwrap();
 
+    let recovery_lease = ingest_lease(&paths);
     IngestState {
         next_doc_id: 3,
         ..IngestState::default()
     }
-    .save_with_lease(&paths.state.join("ingest.json"), &ingest_lease(&paths))
+    .save_with_lease(&paths.state.join("ingest.json"), &recovery_lease)
     .unwrap();
     PendingIngest {
         next_doc_id: 3,
@@ -4242,8 +4246,9 @@ fn cleanup_only_vector_recovery_reconciles_orphans_without_deletion_targets() {
         vector_publication: true,
         embedding_publication: Some(false),
     }
-    .save(&pending_ingest_path(&paths))
+    .save_with_lease(&pending_ingest_path(&paths), &recovery_lease)
     .unwrap();
+    drop(recovery_lease);
 
     // A cleanup-only recovery must be able to use the existing vector
     // store even when the configured embedding model is unavailable.
@@ -4450,7 +4455,9 @@ fn checkpoint_session_keeps_unloaded_absent_and_deleted_paths_distinct() {
         next_doc_id: 99,
         source_paths: vec!["known".to_string()],
         session_scopes: Vec::new(),
+        vector_delete_paths: Vec::new(),
         vector_publication: false,
+        embedding_publication: Some(false),
     };
     state.next_doc_id = 99;
     state.commit_intent(&pending).unwrap();
@@ -4590,7 +4597,6 @@ fn checkpoint_failure_after_publication_keeps_pending_recoverable() {
         last_scan_ts: 1,
         file_count: 7,
         total_bytes: 42,
-        directory_inventory: None,
     }
     .save_with_lease(&cache_path, &lease)
     .unwrap();
@@ -4653,7 +4659,9 @@ fn early_intent_failure_cancels_publication_without_flushing_recovery_changes() 
         next_doc_id: 100,
         source_paths: vec![key.clone()],
         session_scopes: Vec::new(),
+        vector_delete_paths: Vec::new(),
         vector_publication: false,
+        embedding_publication: Some(false),
     };
     pending
         .save_with_lease(&pending_ingest_path(&paths), &lease)

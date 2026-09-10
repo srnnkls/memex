@@ -120,15 +120,6 @@ pub struct ScanCache {
     pub file_count: usize,
     /// Total bytes across all source files
     pub total_bytes: u64,
-    #[serde(default, deserialize_with = "deserialize_directory_inventory")]
-    pub(crate) directory_inventory: Option<crate::directory_inventory::DirectoryInventory>,
-}
-
-fn deserialize_directory_inventory<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<crate::directory_inventory::DirectoryInventory>, D::Error> {
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(serde_json::from_value(value).ok())
 }
 
 impl ScanCache {
@@ -408,7 +399,6 @@ mod tests {
             last_scan_ts: 12,
             file_count: 3,
             total_bytes: 99,
-            directory_inventory: None,
         };
         cache.save(&path).expect("save cache");
 
@@ -437,33 +427,6 @@ mod tests {
         assert_eq!(cache.last_scan_ts, 0);
         assert_eq!(cache.file_count, 0);
         assert_eq!(cache.total_bytes, 0);
-        assert!(cache.directory_inventory.is_none());
-    }
-
-    #[test]
-    fn directory_inventory_cache_compatibility_and_explicit_invalidation() {
-        let legacy = r#"{"last_scan_ts":12,"file_count":3,"total_bytes":99}"#;
-        let cache: ScanCache = serde_json::from_str(legacy).unwrap();
-        assert!(cache.directory_inventory.is_none());
-        for malformed in ["null", "17", "[]", r#"{"version":999}"#] {
-            let payload = format!(
-                "{},\"directory_inventory\":{malformed}}}",
-                &legacy[..legacy.len() - 1]
-            );
-            let cache: ScanCache = serde_json::from_str(&payload).unwrap();
-            assert_eq!(
-                (cache.last_scan_ts, cache.file_count, cache.total_bytes),
-                (12, 3, 99)
-            );
-            assert!(cache.directory_inventory.is_none());
-            assert_eq!(
-                serde_json::to_value(cache)
-                    .unwrap()
-                    .get("directory_inventory"),
-                Some(&serde_json::Value::Null)
-            );
-        }
-        assert!(!cache.is_fresh(0));
     }
 
     #[test]
