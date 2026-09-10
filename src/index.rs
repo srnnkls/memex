@@ -86,7 +86,7 @@ const GENERATION_LEASE_FILE: &str = ".lease";
 const SMALL_INGEST_MAX_BYTES: u64 = 1024 * 1024;
 const CONTINUOUS_MAX_SEGMENTS: usize = 4096;
 /// Segment count above which a search-triggered refresh schedules background compaction.
-pub const SEARCH_REFRESH_COMPACTION_SEGMENTS: usize = 32;
+pub const SEARCH_REFRESH_COMPACTION_SEGMENTS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerationGcReport {
@@ -2738,7 +2738,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let index = SearchIndex::open_or_create_for_search_refresh(temp.path()).unwrap();
         let mut writer = index.writer_for_ingest(Some(1024)).unwrap();
-        for id in 0..12 {
+        for id in 0..6 {
             index
                 .add_record(&mut writer, &test_record(id, "deferred"))
                 .unwrap();
@@ -2746,7 +2746,7 @@ mod tests {
             assert_eq!(index.doc_count().unwrap(), id as usize + 1);
         }
         writer.wait_merging_threads().unwrap();
-        assert_eq!(index.segment_count().unwrap(), 12);
+        assert_eq!(index.segment_count().unwrap(), 6);
         assert!(index.segment_count().unwrap() < SEARCH_REFRESH_COMPACTION_SEGMENTS);
     }
 

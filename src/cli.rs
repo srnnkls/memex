@@ -3264,6 +3264,7 @@ fn collect_search_with_auto_index(
                 recency_half_life_days,
                 min_score,
                 project_grouping: None,
+                text_limit: None,
             };
             let federated = federated_search(
                 &paths,

@@ -65,9 +65,33 @@ pub struct SearchSpec {
     pub recency_half_life_days: f32,
     pub min_score: Option<f32>,
     pub project_grouping: Option<ProjectGrouping>,
+    /// Cap on the characters of `text`, `tool_input`, and `tool_output` returned per record.
+    /// Callers that render excerpts avoid shipping whole tool transcripts; the kept window
+    /// starts at the first query term when that lies beyond the cap.
+    #[serde(default)]
+    pub text_limit: Option<usize>,
 }
 
 impl SearchSpec {
+    fn abbreviate(&self, records: &mut [(f32, Record)]) {
+        let Some(limit) = self.text_limit else {
+            return;
+        };
+        let terms = self
+            .query
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>();
+        for (_, record) in records {
+            abbreviate_field(&mut record.text, limit, &terms);
+            if let Some(input) = record.tool_input.as_mut() {
+                abbreviate_field(input, limit, &terms);
+            }
+            if let Some(output) = record.tool_output.as_mut() {
+                abbreviate_field(output, limit, &terms);
+            }
+        }
+    }
     fn query_options(&self) -> QueryOptions {
         QueryOptions {
             query: self.query.clone(),
@@ -1967,9 +1991,11 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
         RpcOperation::MemoryRead { request } => Ok(RpcPayload::MemoryDocument {
             document: Box::new(read_memory(paths, config, LOCAL_MACHINE_ID, &request)?),
         }),
-        RpcOperation::Search { spec } => Ok(RpcPayload::Records {
-            records: search_local(paths, config, &spec, true)?,
-        }),
+        RpcOperation::Search { spec } => {
+            let mut records = search_local(paths, config, &spec, true)?;
+            spec.abbreviate(&mut records);
+            Ok(RpcPayload::Records { records })
+        }
         RpcOperation::Recent {
             limit,
             project_grouping,
@@ -2534,6 +2560,44 @@ fn apply_project_grouping(
     }
 }
 
+/// Keep `limit` characters of `field`: from the start, or from the first occurrence of a query
+/// term when every term lies beyond the first `limit` characters.
+fn abbreviate_field(field: &mut String, limit: usize, terms: &[String]) {
+    if field.chars().count() <= limit {
+        return;
+    }
+    let lower = field.to_lowercase();
+    let first_hit = terms
+        .iter()
+        .filter(|term| !term.is_empty())
+        .filter_map(|term| lower.find(term.as_str()))
+        .min();
+    let start_byte = match first_hit {
+        Some(byte) if lower[..byte].chars().count() >= limit => {
+            // `lower` and `field` share char boundaries only when lowercasing preserves
+            // lengths; recompute the start on `field` by char count to stay on a boundary.
+            let chars_before = lower[..byte].chars().count();
+            let keep_before = limit / 4;
+            let skip = chars_before.saturating_sub(keep_before);
+            field.char_indices().nth(skip).map_or(0, |(index, _)| index)
+        }
+        _ => 0,
+    };
+    let kept = field[start_byte..]
+        .char_indices()
+        .nth(limit)
+        .map_or(field.len(), |(index, _)| start_byte + index);
+    let mut abbreviated = String::with_capacity(kept - start_byte + 2);
+    if start_byte > 0 {
+        abbreviated.push('…');
+    }
+    abbreviated.push_str(&field[start_byte..kept]);
+    if kept < field.len() {
+        abbreviated.push('…');
+    }
+    *field = abbreviated;
+}
+
 fn ensure_local_index(paths: &Paths, config: &UserConfig) -> Result<()> {
     if config.auto_index_on_search_default() {
         let report = index_local(paths, config, true)?;
@@ -2880,6 +2944,29 @@ fn shell_quote(value: &str) -> String {
 }
 
 #[cfg(test)]
+mod abbreviate_tests {
+    use super::abbreviate_field;
+
+    #[test]
+    fn short_fields_are_untouched_and_long_ones_keep_the_query_window() {
+        let terms = vec!["needle".to_string()];
+        let mut short = "a needle in here".to_string();
+        abbreviate_field(&mut short, 100, &terms);
+        assert_eq!(short, "a needle in here");
+        let mut long = format!("{}needle tail", "x".repeat(500));
+        abbreviate_field(&mut long, 40, &terms);
+        assert!(long.starts_with('…') && long.contains("needle"), "{long}");
+        assert!(long.chars().count() <= 42);
+        let mut early = format!("needle {}", "y".repeat(500));
+        abbreviate_field(&mut early, 40, &terms);
+        assert!(early.starts_with("needle") && early.ends_with('…'));
+        let mut unicode = "é".repeat(50);
+        abbreviate_field(&mut unicode, 10, &[]);
+        assert_eq!(unicode, format!("{}…", "é".repeat(10)));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::analytics::AnalyticsWriter;
@@ -2925,6 +3012,7 @@ mod tests {
             recency_half_life_days: 30.0,
             min_score: None,
             project_grouping: None,
+            text_limit: None,
         }
     }
 
