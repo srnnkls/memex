@@ -1176,6 +1176,7 @@ impl App {
                     embed_runtime: config.resolve_embed_runtime()?,
                     tool_content_limits,
                     defer_merges: false,
+                    journal: false,
                 };
                 ingest_if_stale(&paths, &index, &opts, config.scan_cache_ttl(), &lease)
             })();

@@ -38,6 +38,16 @@ CREATE TABLE IF NOT EXISTS directories (
 );
 ";
 
+/// One row per discovery fingerprint: the file-system event journal position captured by the
+/// last committed refresh. Readers treat a missing table as no cursor.
+const JOURNAL_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS journal (
+    fingerprint TEXT PRIMARY KEY NOT NULL,
+    device_uuid TEXT NOT NULL,
+    event_id INTEGER NOT NULL
+);
+";
+
 pub(super) enum MigrationFailure {
     None,
     #[cfg(test)]
@@ -194,6 +204,7 @@ fn open_connection(state_path: &Path, writable: bool, create: bool) -> Result<Co
 
 fn configure_writer(connection: &Connection) -> Result<()> {
     connection.execute_batch(DIRECTORIES_SCHEMA)?;
+    connection.execute_batch(JOURNAL_SCHEMA)?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
     connection.pragma_update(None, "fullfsync", false)?;

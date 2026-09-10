@@ -2,6 +2,7 @@ mod checkpoint;
 use checkpoint::CheckpointSession;
 pub mod directories;
 mod execution;
+pub mod journal;
 mod publication;
 use discovery::*;
 pub(crate) use discovery::{PathExcluder, build_path_excluder};
@@ -69,6 +70,10 @@ pub struct IngestOptions {
     /// Search-triggered refreshes append without foreground merges; compaction is scheduled
     /// separately once segments accumulate.
     pub defer_merges: bool,
+    /// Narrow full refreshes to the paths named by the file-system event journal since the
+    /// last committed refresh, falling back to a walk when the journal cannot vouch for the
+    /// interval.
+    pub journal: bool,
 }
 
 #[derive(Debug)]
@@ -248,7 +253,7 @@ fn ingest_selected(
     let prepared =
         discovery::prepare_refresh(paths, index, options, &pool, recovered, dirty, None)?;
     let full_scan = prepared.full_scan;
-    if full_scan {
+    if full_scan || dirty.is_none() {
         refresh_memories(paths, options, &repositories)?;
     }
     let report = execution::execute_refresh(prepared, paths, index, options, repositories, &pool)?;

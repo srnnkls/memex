@@ -773,6 +773,7 @@ mod tests {
                 .expect("default embed runtime"),
             tool_content_limits: crate::config::IndexedToolContentLimits::default(),
             defer_merges: false,
+            journal: false,
         }
     }
 

@@ -43,6 +43,7 @@ fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
         embed_runtime: EmbedRuntimeConfig::default(),
         tool_content_limits: IndexedToolContentLimits::default(),
         defer_merges: false,
+        journal: false,
     }
 }
 
@@ -2337,6 +2338,7 @@ fn ingest_claude_records_preserve_sidechain_and_tool_links() {
         embed_runtime: EmbedRuntimeConfig::default(),
         tool_content_limits: IndexedToolContentLimits::default(),
         defer_merges: false,
+        journal: false,
     };
 
     let lease = ingest_lease(&paths);
@@ -2968,6 +2970,7 @@ fn ingest_pi_session_records_supported_message_shapes() {
         embed_runtime: EmbedRuntimeConfig::default(),
         tool_content_limits: IndexedToolContentLimits::default(),
         defer_merges: false,
+        journal: false,
     };
 
     let lease = ingest_lease(&paths);
@@ -4784,4 +4787,76 @@ fn can_skip_fresh_scan(
 ) -> Result<bool> {
     let header = CheckpointReader::open(&paths.state.join("ingest.json"))?.header()?;
     super::can_skip_fresh_scan(&header, paths, index, options, ttl_seconds)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn journal_refreshes_narrow_to_changed_paths_and_walk_after_a_directory_rename() {
+    use std::io::Write;
+
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap().join("claude-projects");
+    let project = root.join("project");
+    fs::create_dir_all(&project).unwrap();
+    let line =
+        |text: &str| format!("{{\"type\":\"user\",\"message\":{{\"content\":\"{text}\"}}}}\n");
+    fs::write(project.join("first.jsonl"), line("alpha")).unwrap();
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let mut options = ingest_options(false, ModelChoice::Gemma);
+    options.claude_sources = vec![root.clone()];
+    options.journal = true;
+    let settle = || std::thread::sleep(Duration::from_millis(150));
+    let refresh = || {
+        let index = open_search_index(&paths);
+        ingest_selected(&paths, &index, &options, &lease, None, None).unwrap()
+    };
+    let indexed = || {
+        let index = open_search_index(&paths);
+        let mut texts = Vec::new();
+        index
+            .for_each_record(|record| {
+                texts.push(record.text.clone());
+                Ok(())
+            })
+            .unwrap();
+        texts.sort();
+        texts
+    };
+
+    let first = refresh();
+    assert!(first.full_scan, "the first refresh has no cursor and walks");
+    assert_eq!(first.report.records_added, 1);
+    settle();
+
+    let mut appended = fs::OpenOptions::new()
+        .append(true)
+        .open(project.join("first.jsonl"))
+        .unwrap();
+    appended.write_all(line("beta").as_bytes()).unwrap();
+    drop(appended);
+    fs::write(project.join("second.jsonl"), line("gamma")).unwrap();
+    settle();
+    let second = refresh();
+    assert!(
+        !second.full_scan,
+        "a journaled interval narrows the refresh"
+    );
+    assert_eq!(second.report.records_added, 2);
+    assert_eq!(indexed(), vec!["alpha", "beta", "gamma"]);
+    settle();
+
+    let third = refresh();
+    assert!(!third.full_scan);
+    assert_eq!(third.report.records_added, 0);
+    settle();
+
+    fs::rename(&project, root.join("renamed")).unwrap();
+    settle();
+    let fourth = refresh();
+    assert!(fourth.full_scan, "a renamed directory forces a walk");
+    assert_eq!(fourth.report.files_scanned, 2);
+    assert_eq!(fourth.report.records_added, 3);
 }

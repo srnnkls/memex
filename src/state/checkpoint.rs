@@ -61,6 +61,7 @@ pub(crate) struct CheckpointDelta {
     pub pending: PendingChange,
     pub scan_cache: Option<ScanCache>,
     pub directory_stamps: Option<crate::ingest::directories::DirectoryStampUpdate>,
+    pub journal_cursor: Option<crate::ingest::journal::JournalCursorUpdate>,
 }
 
 pub(crate) struct CheckpointReader {
@@ -275,6 +276,34 @@ impl CheckpointReader {
             .context("read directory stamps")
     }
 
+    pub(crate) fn load_journal_cursor(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<crate::ingest::journal::JournalCursor>> {
+        let Backend::Sqlite { connection, .. } = &self.backend else {
+            return Ok(None);
+        };
+        let present: i64 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='journal')",
+            [],
+            |row| row.get(0),
+        )?;
+        if present == 0 {
+            return Ok(None);
+        }
+        let mut statement = connection
+            .prepare_cached("SELECT device_uuid, event_id FROM journal WHERE fingerprint=?1")?;
+        statement
+            .query_row([fingerprint], |row| {
+                Ok(crate::ingest::journal::JournalCursor {
+                    device_uuid: row.get(0)?,
+                    event_id: row.get::<_, i64>(1)? as u64,
+                })
+            })
+            .optional()
+            .context("read journal cursor")
+    }
+
     pub(crate) fn file_keys(&self) -> Result<Vec<String>> {
         crate::profiling::count!("state.checkpoint.key_scans", 1);
         match &self.backend {
@@ -438,6 +467,7 @@ impl CheckpointWriter {
                 .directory_stamps
                 .as_ref()
                 .is_none_or(|stamps| stamps.upserts.is_empty() && stamps.deletes.is_empty())
+            && delta.journal_cursor.is_none()
         {
             return Ok(false);
         }
@@ -511,6 +541,17 @@ impl CheckpointWriter {
                 "state.checkpoint.directories_upserted",
                 stamps.upserts.len()
             );
+        }
+        if let Some(journal) = &delta.journal_cursor {
+            transaction.execute("DELETE FROM journal", [])?;
+            transaction.execute(
+                "INSERT INTO journal(fingerprint,device_uuid,event_id) VALUES(?1,?2,?3)",
+                params![
+                    journal.fingerprint,
+                    journal.cursor.device_uuid,
+                    journal.cursor.event_id as i64
+                ],
+            )?;
         }
         if let Some(cache) = &delta.scan_cache {
             let old: Option<String> = transaction.query_row(
