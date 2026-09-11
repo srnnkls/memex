@@ -1043,6 +1043,12 @@ pub(super) fn prepare_refresh(
     // with them; otherwise they stay live and keep matching semantic searches.
     vector_delete_paths.extend(excluded_state_paths.iter().cloned());
     vector_delete_paths.extend(excluded_index_paths.iter().cloned());
+    vector_delete_paths.extend(
+        tasks
+            .iter()
+            .filter(|task| task.delete_first())
+            .map(|task| task.path.to_string_lossy().into_owned()),
+    );
     let mut delete_paths = pending_recovery
         .as_ref()
         .map(|pending| pending.source_paths.clone())

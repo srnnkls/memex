@@ -1095,6 +1095,7 @@ pub(super) fn execute_refresh(
     // predecessor: moved paths would survive as rows with no indexed records, and
     // reparsed messages would be added to the old counts.
     let analytics_needs_backfill = empty_index_rebuild
+        || recovering_pending_ingest
         || if index.doc_count()? == 0 {
             AnalyticsStore::is_ready(&analytics_db)
         } else {
