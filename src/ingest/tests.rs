@@ -966,6 +966,28 @@ fn replacing_transcript_removes_its_old_vectors() {
 }
 
 #[test]
+fn enabling_embeddings_backfills_an_unchanged_lexical_index() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    append_claude_message(&source.join("session.jsonl"), "existing searchable message");
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let mut options = ingest_options(false, ModelChoice::Potion);
+    options.claude_sources = vec![source];
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert!(!VectorIndex::exists(&paths.vectors));
+    options.embeddings = true;
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert_eq!(report.records_added, 0);
+    assert_eq!(report.records_embedded, 1);
+    assert_eq!(VectorIndex::open(&paths.vectors).unwrap().len(), 1);
+}
+
+#[test]
 fn parser_cancellation_preserves_active_vectors() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
