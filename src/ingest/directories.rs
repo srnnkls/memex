@@ -126,7 +126,10 @@ impl StampedWalk {
                 Some(metadata) => metadata,
                 None => match fs::symlink_metadata(&directory) {
                     Ok(metadata) => metadata,
-                    Err(_) => continue,
+                    Err(_) => {
+                        self.forget_ancestors(&directory);
+                        continue;
+                    }
                 },
             };
             if !metadata.is_dir() {
@@ -235,6 +238,18 @@ mod tests {
         update.upserts.iter().cloned().collect()
     }
 
+    /// The checkpoint keeps every stamp and applies each refresh as a delta.
+    fn persist(
+        mut rows: HashMap<PathBuf, DirectoryStamp>,
+        update: &DirectoryStampUpdate,
+    ) -> HashMap<PathBuf, DirectoryStamp> {
+        for directory in &update.deletes {
+            rows.remove(directory);
+        }
+        rows.extend(update.upserts.iter().cloned());
+        rows
+    }
+
     fn settle() {
         // Directory mtimes carry nanoseconds on APFS; a short pause keeps the test honest on
         // filesystems that truncate them.
@@ -305,6 +320,37 @@ mod tests {
         assert_eq!(files, vec![root.join("a/deep/er/four.jsonl")]);
         let update = second.finish("fp".into());
         assert_eq!(update.upserts.len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_could_not_be_stat_ed_is_rediscovered_once_it_is_readable_again() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("projects");
+        touch(&root.join("a/one.jsonl"), "1");
+        touch(&root.join("a/hidden/two.jsonl"), "2");
+        let mut first = StampedWalk::new(HashMap::new(), []);
+        let known = sorted(first.files(&root));
+        let update = first.finish("fp".into());
+        settle();
+
+        // Losing search permission on `a` fails symlink_metadata for its children only.
+        let opaque = fs::Permissions::from_mode(0o600);
+        let readable = fs::metadata(root.join("a")).unwrap().permissions();
+        fs::set_permissions(root.join("a"), opaque).unwrap();
+        let mut persisted = stamps(&update);
+        let mut blocked = StampedWalk::new(persisted.clone(), known.clone());
+        blocked.files(&root);
+        persisted = persist(persisted, &blocked.finish("fp".into()));
+        fs::set_permissions(root.join("a"), readable).unwrap();
+
+        let mut recovered = StampedWalk::new(persisted, known);
+        assert!(
+            sorted(recovered.files(&root)).contains(&root.join("a/hidden/two.jsonl")),
+            "a subtree hidden by a stat failure must be enumerated again"
+        );
     }
 
     #[test]

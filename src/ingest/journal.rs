@@ -301,7 +301,8 @@ mod fsevents {
         let mut watched = Vec::new();
         for root in roots {
             let Ok(metadata) = std::fs::metadata(root) else {
-                continue;
+                captured(None);
+                return JournalReplay::unusable(None, "root vanished");
             };
             match device {
                 None => device = Some(metadata.dev()),

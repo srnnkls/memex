@@ -225,7 +225,10 @@ pub(crate) fn start_journal_replay(
     paths: &Paths,
     options: &IngestOptions,
 ) -> journal::ReplayHandle {
-    let roots = crate::watch::watch_roots(options);
+    let roots = crate::watch::watch_roots(options)
+        .into_iter()
+        .filter(|root| root.exists())
+        .collect::<Vec<_>>();
     let fingerprint = journal_fingerprint(options, &roots);
     let state_path = paths.state.join("ingest.json");
     journal::ReplayHandle::spawn(roots, fingerprint, move |fingerprint| {
