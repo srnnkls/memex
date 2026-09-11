@@ -2239,7 +2239,7 @@ fn run_index_selection(
         );
     }
     drop(lease);
-    if !reindex && report.records_added > 0 {
+    if report.records_added > 0 {
         crate::machine::schedule_compaction_if_fragmented(&paths)?;
     }
     Ok(full_scan)

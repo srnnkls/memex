@@ -88,8 +88,6 @@ const GENERATION_LEASE_FILE: &str = ".lease";
 const SMALL_INGEST_MAX_BYTES: u64 = 1024 * 1024;
 /// Rebuild arena across tantivy's indexing threads; bigger arenas flush fewer, larger segments.
 const REBUILD_MEMORY_BUDGET_BYTES: usize = 1 << 30;
-/// A rebuild publishes at most this many segments; equal-sized groups merge in parallel.
-pub const REBUILD_TARGET_SEGMENTS: usize = 8;
 const CONTINUOUS_MAX_SEGMENTS: usize = 4096;
 /// Segment count above which a search-triggered refresh schedules background compaction.
 pub const SEARCH_REFRESH_COMPACTION_SEGMENTS: usize = 8;
@@ -562,52 +560,13 @@ impl SearchIndex {
         Ok(index)
     }
 
-    /// A rebuild writes every segment with no merges and a large arena, then folds the result
-    /// into at most [`REBUILD_TARGET_SEGMENTS`] segments with parallel merges before publishing.
+    /// A rebuild writes with no merges and a large arena; the segments it publishes are folded
+    /// afterwards by the detached compaction, never in the foreground.
     pub fn open_or_create_for_rebuild(dir: &Path) -> Result<Self> {
         let mut index = Self::open_or_create_for_ingest_with_merge_policy(dir, false)?;
         index.defer_merges = true;
         index.bulk_rebuild = true;
         Ok(index)
-    }
-
-    /// Merges the committed segments into at most `max_segments`, balancing groups by document
-    /// count and running them on tantivy's merge threads concurrently. Returns the number of
-    /// merges issued.
-    pub fn merge_into_at_most(
-        &self,
-        writer: &mut IndexWriter,
-        max_segments: usize,
-    ) -> Result<usize> {
-        crate::profiling::span!("lexical.rebuild_merge");
-        let mut metas = self.index.searchable_segment_metas()?;
-        if metas.len() <= max_segments.max(1) {
-            return Ok(0);
-        }
-        metas.sort_by_key(|meta| std::cmp::Reverse(meta.num_docs()));
-        let mut groups: Vec<(u64, Vec<SegmentId>)> = vec![(0, Vec::new()); max_segments.max(1)];
-        for meta in metas {
-            let group = groups
-                .iter_mut()
-                .min_by_key(|(docs, _)| *docs)
-                .expect("at least one group");
-            group.0 += u64::from(meta.num_docs());
-            group.1.push(meta.id());
-        }
-        let merges = groups
-            .into_iter()
-            .filter(|(_, ids)| ids.len() >= 2)
-            .map(|(_, ids)| writer.merge(&ids))
-            .collect::<Vec<_>>();
-        let issued = merges.len();
-        for merge in merges {
-            merge.wait()?;
-        }
-        Ok(issued)
-    }
-
-    pub fn is_bulk_rebuild(&self) -> bool {
-        self.bulk_rebuild
     }
 
     pub fn segment_count(&self) -> Result<usize> {
@@ -954,28 +913,34 @@ impl SearchIndex {
     }
 
     pub fn add_record(&self, writer: &mut IndexWriter, record: &Record) -> Result<()> {
+        self.add_record_owned(writer, record.clone())
+    }
+
+    /// Moves the record's strings into the document instead of copying them; the ingest
+    /// writer feeds hundreds of thousands of records through here per rebuild.
+    pub fn add_record_owned(&self, writer: &mut IndexWriter, record: Record) -> Result<()> {
         let mut doc = TantivyDocument::default();
         if let Some(field) = self.fields.canonical_record_id {
-            doc.add_text(field, crate::retrieval::canonical_record_id(record));
+            doc.add_text(field, crate::retrieval::canonical_record_id(&record));
         }
         doc.add_u64(self.fields.doc_id, record.doc_id);
         doc.add_u64(self.fields.ts, record.ts);
-        doc.add_text(self.fields.project, &record.project);
-        doc.add_text(self.fields.session_id, &record.session_id);
         doc.add_u64(self.fields.turn_id, record.turn_id as u64);
-        doc.add_text(self.fields.role, &record.role);
-        doc.add_text(self.fields.text, &record.text);
         if let Some(field) = self.fields.source {
             doc.add_text(field, record.source.storage_label());
         }
-        if let Some(tool_name) = &record.tool_name {
-            doc.add_text(self.fields.tool_name, tool_name);
+        doc.add_field_value(self.fields.project, record.project);
+        doc.add_field_value(self.fields.session_id, record.session_id);
+        doc.add_field_value(self.fields.role, record.role);
+        doc.add_field_value(self.fields.text, record.text);
+        if let Some(tool_name) = record.tool_name {
+            doc.add_field_value(self.fields.tool_name, tool_name);
         }
-        if let Some(tool_input) = &record.tool_input {
-            doc.add_text(self.fields.tool_input, tool_input);
+        if let Some(tool_input) = record.tool_input {
+            doc.add_field_value(self.fields.tool_input, tool_input);
         }
-        if let Some(tool_output) = &record.tool_output {
-            doc.add_text(self.fields.tool_output, tool_output);
+        if let Some(tool_output) = record.tool_output {
+            doc.add_field_value(self.fields.tool_output, tool_output);
         }
         add_optional_text(&mut doc, self.fields.event_id, &record.links.event_id);
         add_optional_text(
