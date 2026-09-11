@@ -48,7 +48,7 @@ fn buffered_and_atomic_writes_wait_for_publication_barrier() {
         .unwrap();
     directory.sync_directory().unwrap();
     assert!(
-        !directory
+        directory
             .view
             .read()
             .unwrap()
@@ -170,7 +170,7 @@ fn failed_publication_sync_keeps_current_and_old_segments_until_successful_retry
 }
 
 #[test]
-fn preparation_batches_seven_syncs_before_the_publication_barrier() {
+fn preparation_skips_already_synchronized_metadata_before_the_publication_barrier() {
     let temp = tempfile::tempdir().unwrap();
     let index = SearchIndex::open_or_create_for_ingest(temp.path()).unwrap();
     add(&index, 1);
@@ -187,7 +187,7 @@ fn preparation_batches_seven_syncs_before_the_publication_barrier() {
     index.publish_generation().unwrap();
     assert_eq!(
         *durability.calls.lock().unwrap(),
-        [false, false, false, false, false, false, false, true]
+        [false, false, false, false, false, true]
     );
     assert_eq!(
         SearchIndex::open_or_create(temp.path())

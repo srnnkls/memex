@@ -34,7 +34,9 @@ CREATE TABLE IF NOT EXISTS directories (
     device INTEGER NOT NULL,
     inode INTEGER NOT NULL,
     mtime_secs INTEGER NOT NULL,
-    mtime_nanos INTEGER NOT NULL
+    mtime_nanos INTEGER NOT NULL,
+    ctime_secs INTEGER NOT NULL,
+    ctime_nanos INTEGER NOT NULL
 );
 ";
 
@@ -202,7 +204,25 @@ fn open_connection(state_path: &Path, writable: bool, create: bool) -> Result<Co
     Ok(connection)
 }
 
+fn drop_outdated_directories(connection: &Connection) -> Result<()> {
+    let columns: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('directories') WHERE name='ctime_secs'",
+        [],
+        |row| row.get(0),
+    )?;
+    let table: i64 = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='directories')",
+        [],
+        |row| row.get(0),
+    )?;
+    if table == 1 && columns == 0 {
+        connection.execute_batch("DROP TABLE directories;")?;
+    }
+    Ok(())
+}
+
 fn configure_writer(connection: &Connection) -> Result<()> {
+    drop_outdated_directories(connection)?;
     connection.execute_batch(DIRECTORIES_SCHEMA)?;
     connection.execute_batch(JOURNAL_SCHEMA)?;
     connection.pragma_update(None, "journal_mode", "WAL")?;

@@ -197,6 +197,35 @@ mod tests {
     }
 
     #[test]
+    fn a_second_compaction_is_refused_while_the_first_holds_its_own_lock() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(temp.path().join("memex"))).expect("paths");
+        assert_ne!(compaction_lock_path(&paths), lease_path(&paths));
+
+        let first = CompactionLock::try_acquire(&paths)
+            .expect("first compaction lock")
+            .expect("first compaction should be available");
+        assert!(
+            CompactionLock::try_acquire(&paths)
+                .expect("second compaction lock")
+                .is_none()
+        );
+
+        let ingest = match IngestLease::try_acquire(&paths, "refresh").expect("ingest lease") {
+            LeaseAttempt::Acquired(lease) => lease,
+            LeaseAttempt::Busy(_) => panic!("compaction lock must not hold the ingest lease"),
+        };
+        drop(ingest);
+
+        drop(first);
+        assert!(
+            CompactionLock::try_acquire(&paths)
+                .expect("third compaction lock")
+                .is_some()
+        );
+    }
+
+    #[test]
     fn timed_out_lease_names_the_holder() {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(temp.path().join("memex"))).expect("paths");

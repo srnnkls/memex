@@ -42,6 +42,11 @@ struct Manifest {
     files: BTreeMap<String, String>,
 }
 
+/// Abandoned generations are removed without the store lock, and hold no published references.
+fn removed_concurrently(directory: &Path, error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound && !directory.exists()
+}
+
 impl Manifest {
     fn empty() -> Self {
         Self {
@@ -56,14 +61,23 @@ impl Manifest {
         if !marker.try_exists()? && !manifest.try_exists()? {
             return Ok(None);
         }
-        if fs::read_to_string(&marker).context("read shared-segment format")? != FORMAT_VERSION {
+        let format = match fs::read_to_string(&marker) {
+            Ok(format) => format,
+            Err(error) if removed_concurrently(directory, &error) => return Ok(None),
+            Err(error) => return Err(error).context("read shared-segment format"),
+        };
+        if format != FORMAT_VERSION {
             bail!(
                 "unsupported shared-segment format in {}",
                 directory.display()
             );
         }
-        let parsed: Self =
-            serde_json::from_slice(&fs::read(&manifest).context("read segment references")?)?;
+        let references = match fs::read(&manifest) {
+            Ok(references) => references,
+            Err(error) if removed_concurrently(directory, &error) => return Ok(None),
+            Err(error) => return Err(error).context("read segment references"),
+        };
+        let parsed: Self = serde_json::from_slice(&references)?;
         if parsed.version != 1 {
             bail!("unsupported segment-reference version {}", parsed.version);
         }
@@ -141,6 +155,25 @@ pub(super) fn lock_store(root: &Path) -> Result<StoreGuard> {
     Ok(StoreGuard { _file: file })
 }
 
+pub(super) fn lock_existing_store(root: &Path) -> Result<Option<StoreGuard>> {
+    let store = root.join(STORE);
+    match fs::symlink_metadata(&store) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("segment store must not be a symlink");
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    let file = match File::open(store.join(".lock")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    file.lock_shared()?;
+    Ok(Some(StoreGuard { _file: file }))
+}
+
 #[derive(Debug)]
 struct View {
     local: MmapDirectory,
@@ -172,7 +205,7 @@ impl SharedDirectory {
             bail!("segment store must not be a symlink");
         }
         let store = MmapDirectory::open(&store_path)?;
-        Ok(Some(Self {
+        let directory = Self {
             store,
             store_path,
             view: Arc::new(RwLock::new(View {
@@ -187,7 +220,14 @@ impl SharedDirectory {
                 #[cfg(target_os = "macos")]
                 durability: None,
             })),
-        }))
+        };
+        {
+            let view = directory.view.read().unwrap();
+            for (name, owner) in &view.manifest.files {
+                directory.shared_path(owner, name)?;
+            }
+        }
+        Ok(Some(directory))
     }
 
     pub fn stage(
@@ -356,8 +396,9 @@ fn adopt_file(root: &Path, owner: &str, name: &Path, source: &Path) -> Result<()
         Err(error) => return Err(error.into()),
     }
     if fs::hard_link(source, &target).is_err() {
-        fs::copy(source, &target)?;
-        File::open(&target)?.sync_all()?;
+        let mut destination = File::create_new(&target)?;
+        io::copy(&mut File::open(source)?, &mut destination)?;
+        destination.sync_all()?;
     }
     Ok(())
 }
@@ -500,7 +541,7 @@ impl Directory for SharedDirectory {
         #[cfg(target_os = "macos")]
         let durable = if let Some((durability, directory)) = staging {
             durability.atomic_write(&directory, path, data)?;
-            false
+            true
         } else {
             local.atomic_write(path, data)?;
             true
@@ -671,6 +712,22 @@ mod tests {
 
     fn bytes(directory: &SharedDirectory, path: &str) -> Vec<u8> {
         directory.atomic_read(Path::new(path)).unwrap()
+    }
+
+    #[test]
+    fn a_generation_removed_between_listing_and_read_contributes_no_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let removed = temp.path().join("generations/.pending.tmp");
+        assert!(Manifest::read(&removed).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_present_generation_missing_its_format_marker_still_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let generation = temp.path().join("generations/live");
+        fs::create_dir_all(&generation).unwrap();
+        fs::write(generation.join(MANIFEST), b"{\"version\":1,\"files\":{}}").unwrap();
+        assert!(Manifest::read(&generation).is_err());
     }
 
     #[test]
@@ -905,5 +962,11 @@ mod tests {
         fs::remove_file(root.join(STORE).join(&owner).join(path)).unwrap();
         assert!(directory.get_file_handle(path).is_err());
         assert!(directory.exists(path).is_err());
+        let generation = root.join(GENERATIONS_DIR).join(&owner);
+        assert!(SharedDirectory::open(root, &generation, true).is_err());
+        let next = new_generation_name();
+        let destination = root.join(GENERATIONS_DIR).join(&next);
+        fs::create_dir(&destination).unwrap();
+        assert!(SharedDirectory::stage(root, &destination, Some(&generation), &next).is_err());
     }
 }

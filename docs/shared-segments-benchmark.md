@@ -15,7 +15,7 @@ Automatic indexing was enabled, scan-cache TTL was zero, and embeddings were dis
 | Median | 457.32 ms | 311.04 ms |
 | p95 | 466.71 ms | 318.70 ms |
 
-These final-binary samples contained 86–95 segments after earlier benchmark appends. Each append added 3,740–3,780 bytes. Median latency fell 32.0%; p95 fell 31.7%. The 250 ms small-update target remains unmet. These are matched-workload comparisons, unlike the earlier twenty-record versus three-record receipts in [refresh-benchmark.md](refresh-benchmark.md).
+These final-binary samples contained 86–95 segments after earlier benchmark appends. Each append added 3,740–3,780 bytes. Median latency fell 32.0%; p95 fell 31.7%. The 250 ms small-update target remains unmet. These are matched-workload comparisons.
 
 The preceding production cohort measured 428.33 → 302.15 ms median and 447.55 → 321.25 ms p95, before the final reader-lease ownership fix and subsequent corpus growth. Do not pool the cohorts.
 

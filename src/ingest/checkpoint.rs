@@ -60,14 +60,11 @@ impl CheckpointSession {
         self.writer.reader().load_directory_stamps(fingerprint)
     }
 
-    /// Paths the last committed checkpoint saw modified at or after `since` (Unix seconds).
-    pub fn hot_file_keys(&self, since: i64) -> Result<Vec<String>> {
-        Ok(self
-            .writer
-            .reader()
-            .hot_files_since(since)?
-            .into_keys()
-            .collect())
+    /// Paths the refresh must stat whatever the event stream said, at or after `since`
+    /// (Unix seconds): the watch daemon's sweep candidates, resolved the same way.
+    pub fn sweep_candidate_keys(&self, since: i64) -> Result<Vec<String>> {
+        let (files, databases) = crate::watch::sweep_candidates(self.writer.reader(), since)?;
+        Ok(files.into_keys().chain(databases).collect())
     }
 
     pub fn preload(&mut self, paths: &[String]) -> Result<()> {

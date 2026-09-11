@@ -240,7 +240,7 @@ EXAMPLES:
         #[command(flatten)]
         index: IndexArgs,
     },
-    /// Merge every searchable segment but the largest few into one
+    /// Merge segments below 5% of the corpus, excluding the three largest
     #[command(hide = true)]
     IndexCompact {
         /// Path to memex data directory [default: ~/.memex]
@@ -2209,7 +2209,10 @@ fn run_index_selection(
     let index = if reindex {
         SearchIndex::open_or_create_for_rebuild(&paths.index)?
     } else {
-        SearchIndex::open_or_create_for_search_refresh(&paths.index)?
+        match SearchIndex::open_or_create(&paths.index) {
+            Ok(index) if !index.is_writable() => index,
+            _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
+        }
     };
 
     let (report, full_scan) = if let Some(dirty) = dirty {
@@ -2346,8 +2349,6 @@ fn run_index_compact(root: Option<PathBuf>) -> Result<()> {
         println!("no index to compact");
         return Ok(());
     }
-    // The merge below runs without the ingest lease so searches keep working, so the lease
-    // cannot keep two compactions apart. This can.
     let Some(_compaction) = crate::lease::CompactionLock::try_acquire(&paths)? else {
         println!("compaction already running");
         return Ok(());
@@ -3312,6 +3313,8 @@ fn collect_search_with_auto_index(
         top_n_per_session
     };
     let kind_filter: crate::analytics::SessionKindFilter = origin.into();
+    // `--full` clears the field set and asks for whole records; everything else renders excerpts.
+    let text_limit = fields.as_ref().map(|_| crate::machine::SEARCH_TEXT_BUDGET);
     let render = RenderOptions {
         verbose,
         pretty: false,
@@ -3369,7 +3372,7 @@ fn collect_search_with_auto_index(
                 recency_half_life_days,
                 min_score,
                 project_grouping: None,
-                text_limit: None,
+                text_limit,
             };
             let federated = federated_search(
                 &paths,
@@ -7445,7 +7448,7 @@ fn format_ts(ts: u64) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
+pub(crate) fn query_literals(query: &str) -> Vec<String> {
     use tantivy::query_grammar::{Occur, UserInputAst, UserInputLeaf};
     fn literals(ast: &UserInputAst, terms: &mut Vec<String>) {
         match ast {
@@ -7484,13 +7487,20 @@ pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
         if term.is_empty() || !seen.insert(term.clone()) {
             continue;
         }
-        out.push(
-            RegexBuilder::new(&regex::escape(&term))
-                .case_insensitive(true)
-                .build()?,
-        );
+        out.push(term);
     }
-    Ok(out)
+    out
+}
+
+pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
+    query_literals(query)
+        .into_iter()
+        .map(|term| {
+            Ok(RegexBuilder::new(&regex::escape(&term))
+                .case_insensitive(true)
+                .build()?)
+        })
+        .collect()
 }
 
 // Preview the earliest literal hit; semantic-only hits fall back to a compact prefix.

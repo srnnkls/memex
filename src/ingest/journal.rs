@@ -6,6 +6,8 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournalCursor {
@@ -58,6 +60,7 @@ pub struct ReplayHandle {
     next: std::sync::mpsc::Receiver<Option<JournalCursor>>,
     outcome: std::sync::mpsc::Receiver<Replay>,
     started: std::time::Instant,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl ReplayHandle {
@@ -71,14 +74,20 @@ impl ReplayHandle {
         let (next_tx, next) = std::sync::mpsc::channel();
         let (outcome_tx, outcome) = std::sync::mpsc::channel();
         let key = fingerprint.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let thread_cancelled = cancelled.clone();
         std::thread::Builder::new()
             .name("memex-journal".into())
             .spawn(move || {
                 let previous = previous(&key);
+                if thread_cancelled.load(Ordering::Relaxed) {
+                    return;
+                }
                 let replay = replay_with(
                     &roots,
                     previous.as_ref(),
                     REPLAY_TIMEOUT,
+                    &thread_cancelled,
                     |next| {
                         let _ = next_tx.send(next.cloned());
                     },
@@ -95,6 +104,7 @@ impl ReplayHandle {
             next,
             outcome,
             started: std::time::Instant::now(),
+            cancelled,
         }
     }
 
@@ -107,7 +117,7 @@ impl ReplayHandle {
 
     /// Waits until `budget` after spawning for the outcome. The cursor arrives before any
     /// event is read, so it is available even when the outcome is abandoned.
-    pub fn wait(self, budget: std::time::Duration) -> (String, JournalReplay) {
+    pub fn wait(mut self, budget: std::time::Duration) -> (String, JournalReplay) {
         let deadline = self.started + budget;
         // The cursor normally lands well before the budget, but the replay thread reaches it
         // only after opening the checkpoint, so this waits against the same deadline as the
@@ -120,7 +130,16 @@ impl ReplayHandle {
             .outcome
             .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
             .unwrap_or(Replay::Unusable("replay budget exceeded"));
-        (self.fingerprint, JournalReplay { next, outcome })
+        (
+            std::mem::take(&mut self.fingerprint),
+            JournalReplay { next, outcome },
+        )
+    }
+}
+
+impl Drop for ReplayHandle {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
     }
 }
 
@@ -129,7 +148,14 @@ pub fn replay(
     previous: Option<&JournalCursor>,
     timeout: std::time::Duration,
 ) -> JournalReplay {
-    replay_with(roots, previous, timeout, |_| {}, || {})
+    replay_with(
+        roots,
+        previous,
+        timeout,
+        &AtomicBool::new(false),
+        |_| {},
+        || {},
+    )
 }
 
 /// Replay cost grows with every event the volume logged since the cursor, not only those under
@@ -141,6 +167,7 @@ fn replay_with(
     _roots: &[PathBuf],
     _previous: Option<&JournalCursor>,
     _timeout: std::time::Duration,
+    _cancelled: &AtomicBool,
     _captured: impl FnOnce(Option<&JournalCursor>),
     _streaming: impl FnOnce(),
 ) -> JournalReplay {
@@ -160,6 +187,7 @@ mod fsevents {
     use std::os::raw::{c_char, c_void};
     use std::os::unix::fs::MetadataExt;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     type CFUUIDRef = cf::CFRef;
@@ -282,17 +310,19 @@ mod fsevents {
         roots: &[PathBuf],
         previous: Option<&JournalCursor>,
         timeout: Duration,
+        cancelled: &AtomicBool,
         captured: impl FnOnce(Option<&JournalCursor>),
         streaming: impl FnOnce(),
     ) -> JournalReplay {
         crate::profiling::span!("journal.replay");
-        replay_inner(roots, previous, timeout, captured, streaming)
+        replay_inner(roots, previous, timeout, cancelled, captured, streaming)
     }
 
     fn replay_inner(
         roots: &[PathBuf],
         previous: Option<&JournalCursor>,
         timeout: Duration,
+        cancelled: &AtomicBool,
         captured: impl FnOnce(Option<&JournalCursor>),
         streaming: impl FnOnce(),
     ) -> JournalReplay {
@@ -301,7 +331,8 @@ mod fsevents {
         let mut watched = Vec::new();
         for root in roots {
             let Ok(metadata) = std::fs::metadata(root) else {
-                continue;
+                captured(None);
+                return JournalReplay::unusable(None, "root vanished");
             };
             match device {
                 None => device = Some(metadata.dev()),
@@ -357,6 +388,7 @@ mod fsevents {
                 &watched,
                 previous.event_id,
                 timeout,
+                cancelled,
                 &mut collector,
                 _streaming,
             )
@@ -396,6 +428,7 @@ mod fsevents {
         roots: &[PathBuf],
         since: fse::FSEventStreamEventId,
         timeout: Duration,
+        cancelled: &AtomicBool,
         collector: &mut Collector,
         mut streaming: Streaming<impl FnOnce()>,
     ) -> Result<(), &'static str> {
@@ -445,13 +478,20 @@ mod fsevents {
         streaming.fire();
         if started {
             let deadline = Instant::now() + timeout;
-            while !collector.done && collector.unusable.is_none() {
+            while !collector.done
+                && collector.unusable.is_none()
+                && !cancelled.load(Ordering::Relaxed)
+            {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     break;
                 }
                 unsafe {
-                    CFRunLoopRunInMode(cf::kCFRunLoopDefaultMode, remaining.as_secs_f64(), 1)
+                    CFRunLoopRunInMode(
+                        cf::kCFRunLoopDefaultMode,
+                        remaining.min(Duration::from_millis(5)).as_secs_f64(),
+                        1,
+                    )
                 };
             }
             unsafe { fse::FSEventStreamStop(stream) };
@@ -474,6 +514,50 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::path::Path;
+    use std::time::Duration;
+
+    #[test]
+    fn abandoned_replay_cancels_before_loading_finishes() {
+        let (release, resume) = std::sync::mpsc::channel();
+        let handle = ReplayHandle::spawn(Vec::new(), "test".into(), move |_| {
+            resume.recv().unwrap();
+            None
+        });
+        let cancelled = Arc::downgrade(&handle.cancelled);
+        let streaming = &handle.streaming;
+        assert!(matches!(
+            streaming.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(handle);
+        assert!(cancelled.upgrade().unwrap().load(Ordering::Relaxed));
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while cancelled.upgrade().is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            cancelled.upgrade().is_none(),
+            "cancelled replay thread must exit"
+        );
+    }
+
+    #[test]
+    fn blocked_checkpoint_load_does_not_extend_replay_budget() {
+        let (release, resume) = std::sync::mpsc::channel();
+        let handle = ReplayHandle::spawn(Vec::new(), "test".into(), move |_| {
+            resume.recv().unwrap();
+            None
+        });
+        let started = std::time::Instant::now();
+        let (_, replay) = handle.wait(Duration::from_millis(10));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(matches!(
+            replay.outcome,
+            Replay::Unusable("replay budget exceeded")
+        ));
+        release.send(()).unwrap();
+    }
 
     fn touch(path: &Path, text: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();

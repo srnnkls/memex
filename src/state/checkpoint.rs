@@ -259,7 +259,7 @@ impl CheckpointReader {
             return Ok(HashMap::new());
         }
         let mut statement = connection.prepare_cached(
-            "SELECT path, device, inode, mtime_secs, mtime_nanos FROM directories WHERE fingerprint=?1",
+            "SELECT path, device, inode, mtime_secs, mtime_nanos, ctime_secs, ctime_nanos FROM directories WHERE fingerprint=?1",
         )?;
         let rows = statement.query_map([fingerprint], |row| {
             Ok((
@@ -269,6 +269,8 @@ impl CheckpointReader {
                     inode: row.get::<_, i64>(2)? as u64,
                     mtime_secs: row.get(3)?,
                     mtime_nanos: row.get(4)?,
+                    ctime_secs: row.get(5)?,
+                    ctime_nanos: row.get(6)?,
                 },
             ))
         })?;
@@ -525,7 +527,7 @@ impl CheckpointWriter {
                 delete.execute([path.to_string_lossy().as_ref()])?;
             }
             let mut upsert = transaction.prepare_cached(
-                "INSERT INTO directories(path,fingerprint,device,inode,mtime_secs,mtime_nanos) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(path) DO UPDATE SET fingerprint=excluded.fingerprint, device=excluded.device, inode=excluded.inode, mtime_secs=excluded.mtime_secs, mtime_nanos=excluded.mtime_nanos",
+                "INSERT INTO directories(path,fingerprint,device,inode,mtime_secs,mtime_nanos,ctime_secs,ctime_nanos) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(path) DO UPDATE SET fingerprint=excluded.fingerprint, device=excluded.device, inode=excluded.inode, mtime_secs=excluded.mtime_secs, mtime_nanos=excluded.mtime_nanos, ctime_secs=excluded.ctime_secs, ctime_nanos=excluded.ctime_nanos",
             )?;
             for (path, stamp) in &stamps.upserts {
                 upsert.execute(params![
@@ -535,6 +537,8 @@ impl CheckpointWriter {
                     stamp.inode as i64,
                     stamp.mtime_secs,
                     stamp.mtime_nanos,
+                    stamp.ctime_secs,
+                    stamp.ctime_nanos,
                 ])?;
             }
             crate::profiling::count!(

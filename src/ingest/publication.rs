@@ -25,7 +25,8 @@ pub(super) fn writer_loop(
     if first.is_none()
         && delete_paths.is_empty()
         && ctx.scope_targets.is_empty()
-        && !ctx.embeddings
+        && !ctx.do_backfill_embeddings
+        && !ctx.reset_vector_store
         && !ctx.reconcile_vector_ids
     {
         return match decision_rx.recv() {
@@ -362,9 +363,14 @@ pub(super) fn updated_scan_cache(
     cache: Option<ScanCache>,
     files_scanned: usize,
     total_bytes: u64,
+    full_scan: bool,
 ) -> Option<ScanCache> {
     cache.map(|mut cache| {
-        cache.update(files_scanned, total_bytes);
+        if full_scan {
+            cache.update(files_scanned, total_bytes);
+        } else {
+            cache.touch();
+        }
         cache
     })
 }

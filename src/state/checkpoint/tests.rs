@@ -1515,6 +1515,8 @@ fn directory_stamps_round_trip_under_their_fingerprint_only() {
         inode: 7,
         mtime_secs: 1_700_000_000,
         mtime_nanos: 123_456_789,
+        ctime_secs: 1_700_000_001,
+        ctime_nanos: 987_654_321,
     };
     writer
         .commit_delta(&CheckpointDelta {
@@ -1617,6 +1619,8 @@ fn writers_add_the_directories_table_to_existing_databases() {
                         inode: 2,
                         mtime_secs: 3,
                         mtime_nanos: 4,
+                        ctime_secs: 5,
+                        ctime_nanos: 6,
                     },
                 )],
                 deletes: Vec::new(),
