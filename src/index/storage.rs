@@ -155,6 +155,25 @@ pub(super) fn lock_store(root: &Path) -> Result<StoreGuard> {
     Ok(StoreGuard { _file: file })
 }
 
+pub(super) fn lock_existing_store(root: &Path) -> Result<Option<StoreGuard>> {
+    let store = root.join(STORE);
+    match fs::symlink_metadata(&store) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("segment store must not be a symlink");
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    let file = match File::open(store.join(".lock")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    file.lock_shared()?;
+    Ok(Some(StoreGuard { _file: file }))
+}
+
 #[derive(Debug)]
 struct View {
     local: MmapDirectory,
@@ -186,7 +205,7 @@ impl SharedDirectory {
             bail!("segment store must not be a symlink");
         }
         let store = MmapDirectory::open(&store_path)?;
-        Ok(Some(Self {
+        let directory = Self {
             store,
             store_path,
             view: Arc::new(RwLock::new(View {
@@ -201,7 +220,14 @@ impl SharedDirectory {
                 #[cfg(target_os = "macos")]
                 durability: None,
             })),
-        }))
+        };
+        {
+            let view = directory.view.read().unwrap();
+            for (name, owner) in &view.manifest.files {
+                directory.shared_path(owner, name)?;
+            }
+        }
+        Ok(Some(directory))
     }
 
     pub fn stage(
@@ -370,8 +396,9 @@ fn adopt_file(root: &Path, owner: &str, name: &Path, source: &Path) -> Result<()
         Err(error) => return Err(error.into()),
     }
     if fs::hard_link(source, &target).is_err() {
-        fs::copy(source, &target)?;
-        File::open(&target)?.sync_all()?;
+        let mut destination = File::create_new(&target)?;
+        io::copy(&mut File::open(source)?, &mut destination)?;
+        destination.sync_all()?;
     }
     Ok(())
 }
@@ -514,7 +541,7 @@ impl Directory for SharedDirectory {
         #[cfg(target_os = "macos")]
         let durable = if let Some((durability, directory)) = staging {
             durability.atomic_write(&directory, path, data)?;
-            false
+            true
         } else {
             local.atomic_write(path, data)?;
             true
@@ -935,5 +962,11 @@ mod tests {
         fs::remove_file(root.join(STORE).join(&owner).join(path)).unwrap();
         assert!(directory.get_file_handle(path).is_err());
         assert!(directory.exists(path).is_err());
+        let generation = root.join(GENERATIONS_DIR).join(&owner);
+        assert!(SharedDirectory::open(root, &generation, true).is_err());
+        let next = new_generation_name();
+        let destination = root.join(GENERATIONS_DIR).join(&next);
+        fs::create_dir(&destination).unwrap();
+        assert!(SharedDirectory::stage(root, &destination, Some(&generation), &next).is_err());
     }
 }

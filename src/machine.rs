@@ -80,11 +80,7 @@ impl SearchSpec {
         let Some(limit) = self.text_limit else {
             return;
         };
-        let terms = self
-            .query
-            .split_whitespace()
-            .map(str::to_lowercase)
-            .collect::<Vec<_>>();
+        let terms = crate::cli::query_literals(&self.query);
         for (_, record) in records {
             abbreviate_field(&mut record.text, limit, &terms);
             if let Some(input) = record.tool_input.as_mut() {
@@ -2683,7 +2679,7 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
             _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
         }
     } else {
-        SearchIndex::open_or_create_for_ingest(&paths.index)?
+        SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?
     };
     if stale_only {
         Ok(ingest_if_stale(
@@ -2986,6 +2982,16 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod abbreviate_tests {
     use super::abbreviate_field;
+
+    #[test]
+    fn query_syntax_keeps_the_positive_text_window() {
+        for query in ["\"needle\"", "text:needle AND NOT text:padding"] {
+            let mut field = format!("padding {} needle evidence", "x".repeat(200));
+            abbreviate_field(&mut field, 40, &crate::cli::query_literals(query));
+            assert!(field.contains("needle"));
+            assert!(!field.contains("padding"));
+        }
+    }
 
     #[test]
     fn short_fields_are_untouched_and_long_ones_keep_the_query_window() {

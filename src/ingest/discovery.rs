@@ -418,16 +418,14 @@ pub(super) fn prepare_file_task(
         ),
         _ => (0, 0, HashMap::new()),
     };
-    let claude_background = resolve_claude_background(
-        &path,
-        source,
-        size,
-        previous,
-        &mut change,
-        &mut offset,
-        &mut turn_id,
-        &mut pending_tool_calls,
-    );
+    let claude = resolve_claude_background(&path, source, size, previous, change);
+    if claude.reparse {
+        change = FileChange::Replaced;
+        offset = 0;
+        turn_id = 0;
+        pending_tool_calls.clear();
+    }
+    let claude_background = claude.background;
 
     (
         FileTask {
@@ -460,32 +458,31 @@ pub(super) fn prepare_file_task(
 /// Claude marks a whole transcript as a background session with a file-level flag that can
 /// appear long after its first records were indexed. Discovering it late reclassifies every
 /// record in the file, so the transcript is reparsed from zero when the marker turns up.
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClaudeBackground {
+    background: Option<bool>,
+    reparse: bool,
+}
+
 fn resolve_claude_background(
     path: &Path,
     source: SourceKind,
     size: u64,
     previous: Option<&FileState>,
-    change: &mut FileChange,
-    offset: &mut u64,
-    turn_id: &mut u32,
-    pending_tool_calls: &mut HashMap<String, PendingToolCall>,
-) -> Option<bool> {
+    change: FileChange,
+) -> ClaudeBackground {
     if source != SourceKind::Claude {
-        return None;
+        return ClaudeBackground::default();
     }
     if change.replaces_records() {
         // A replacement must rediscover the marker from the new contents.
-        return None;
+        return ClaudeBackground::default();
     }
-    let mut background = previous.and_then(|state| state.claude_background);
-    let mut reparse = || {
-        *change = FileChange::Replaced;
-        *offset = 0;
-        *turn_id = 0;
-        pending_tool_calls.clear();
+    let mut resolved = ClaudeBackground {
+        background: previous.and_then(|state| state.claude_background),
+        reparse: false,
     };
-    match background {
+    match resolved.background {
         Some(true) => {}
         Some(false) if size > previous.map_or(0, |state| state.offset) => {
             match crate::sources::claude::has_background_session_kind_since(
@@ -496,8 +493,8 @@ fn resolve_claude_background(
                 // If the tail cannot be inspected, fail safe by reparsing; parsing
                 // will surface a persistent read failure.
                 Ok(true) | Err(_) => {
-                    background = None;
-                    reparse();
+                    resolved.background = None;
+                    resolved.reparse = true;
                 }
                 Ok(false) => {}
             }
@@ -505,15 +502,15 @@ fn resolve_claude_background(
         None if previous.is_some() => {
             // State written before this was tracked needs a one-time full check;
             // later appends inspect only their own tail.
-            background =
+            resolved.background =
                 crate::sources::claude::has_background_session_kind_since(path, 0, size).ok();
-            if background == Some(true) && previous.is_some_and(|state| state.offset > 0) {
-                reparse();
+            if resolved.background == Some(true) && previous.is_some_and(|state| state.offset > 0) {
+                resolved.reparse = true;
             }
         }
         _ => {}
     }
-    background
+    resolved
 }
 
 pub(super) fn discovered_metadata(path: &Path) -> Result<Option<std::fs::Metadata>> {
@@ -1018,7 +1015,7 @@ pub(super) fn prepare_refresh(
     } else {
         None
     };
-    let mut journal_cursor = None;
+    let mut journal_cursor = state.journal_cursor.take();
     let mut journal_narrowed = false;
     let selected = match (selected, journal) {
         (None, Some(journal))
@@ -1273,6 +1270,12 @@ pub(super) fn prepare_refresh(
     // with them; otherwise they stay live and keep matching semantic searches.
     vector_delete_paths.extend(excluded_state_paths.iter().cloned());
     vector_delete_paths.extend(excluded_index_paths.iter().cloned());
+    vector_delete_paths.extend(
+        tasks
+            .iter()
+            .filter(|task| task.delete_first())
+            .map(|task| task.path.to_string_lossy().into_owned()),
+    );
     let mut delete_paths = pending_recovery
         .as_ref()
         .map(|pending| pending.source_paths.clone())

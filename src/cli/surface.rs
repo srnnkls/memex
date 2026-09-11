@@ -14,7 +14,7 @@ pub(super) enum IndexCommand {
         #[command(flatten)]
         index: IndexArgs,
     },
-    /// Merge every segment but the largest few into one; runs detached after search refreshes
+    /// Merge segments below 5% of the corpus, excluding the three largest
     #[command(hide = true)]
     Compact {
         #[arg(long)]

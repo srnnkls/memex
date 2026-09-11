@@ -184,7 +184,10 @@ pub(super) fn finish_source_parse_with_codex_metadata(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one checkpoint assembled from independent parser outputs"
+)]
 fn finish_parsed_source(
     task: &FileTask,
     tx_update: &Sender<FileUpdate>,
@@ -1096,6 +1099,7 @@ pub(super) fn execute_refresh(
     // predecessor: moved paths would survive as rows with no indexed records, and
     // reparsed messages would be added to the old counts.
     let analytics_needs_backfill = empty_index_rebuild
+        || recovering_pending_ingest
         || if index.doc_count()? == 0 {
             AnalyticsStore::is_ready(&analytics_db)
         } else {
@@ -1126,7 +1130,7 @@ pub(super) fn execute_refresh(
     });
     if decision != plan::RefreshDecision::Publish {
         if analytics_needs_backfill {
-            backfill_from_index(&analytics_db, index)?;
+            backfill_from_index_with_repositories(&analytics_db, index, repositories.clone())?;
         }
         crate::profiling::count!("ingest.noop_returns", 1);
         index.publish_generation_if_uninitialized()?;
@@ -1218,7 +1222,8 @@ pub(super) fn execute_refresh(
         embeddings,
         do_backfill_embeddings: options.backfill_embeddings
             || vector_migration.rebuild
-            || recover_embeddings,
+            || recover_embeddings
+            || (embeddings && vector_work),
         reset_vector_store: vector_migration.rebuild,
         vector_dir: paths.vectors.clone(),
         analytics_path: analytics_db.clone(),
@@ -1229,7 +1234,7 @@ pub(super) fn execute_refresh(
         reconcile_vector_ids: reconcile_pending_vector_ids,
         scope_targets: opencode_scope_targets.clone(),
         opencode_session_cwds: opencode_session_cwds.clone(),
-        repositories,
+        repositories: repositories.clone(),
         codex_metadata_checkpoints: tasks
             .iter()
             .filter_map(|task| {
@@ -1343,7 +1348,11 @@ pub(super) fn execute_refresh(
         };
         if analytics_needs_backfill {
             let published_index = SearchIndex::open_or_create(&paths.index)?;
-            backfill_from_index(&analytics_db, &published_index)?;
+            backfill_from_index_with_repositories(
+                &analytics_db,
+                &published_index,
+                repositories.clone(),
+            )?;
         } else {
             AnalyticsStore::open(&analytics_db)?.mark_complete()?;
         }

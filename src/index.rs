@@ -389,24 +389,35 @@ impl SearchIndex {
         dir: &Path,
         dry_run: bool,
     ) -> Result<GenerationGcReport> {
-        let _store_guard = storage::lock_store(dir)?;
+        let _store_guard = if dry_run {
+            storage::lock_existing_store(dir)?
+        } else {
+            Some(storage::lock_store(dir)?)
+        };
         let source = resolve_current_generation(dir).unwrap_or_else(|| dir.to_path_buf());
         if !source.join("meta.json").is_file() {
             bail!("no committed index exists at {}", dir.display());
         }
 
         let generations = dir.join(GENERATIONS_DIR);
-        fs::create_dir_all(&generations)?;
-        let old_generations = fs::read_dir(&generations)?
-            .filter_map(|entry| entry.ok())
+        if !dry_run {
+            fs::create_dir_all(&generations)?;
+        }
+        let entries = match fs::read_dir(&generations) {
+            Ok(entries) => entries.collect::<io::Result<Vec<_>>>()?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let old_generations = entries
+            .iter()
             .filter(|entry| {
                 entry.file_type().is_ok_and(|kind| kind.is_dir())
                     && !entry.file_name().to_string_lossy().starts_with('.')
             })
             .map(|entry| entry.path())
             .collect::<Vec<_>>();
-        let abandoned_workdirs = fs::read_dir(&generations)?
-            .filter_map(|entry| entry.ok())
+        let abandoned_workdirs = entries
+            .iter()
             .filter(|entry| {
                 entry.file_type().is_ok_and(|kind| kind.is_dir())
                     && is_abandoned_generation_workdir(&entry.file_name())
@@ -570,7 +581,7 @@ impl SearchIndex {
             .iter()
             .map(|segment| u64::from(segment.num_docs()))
             .sum::<u64>();
-        let ceiling = (total as f64 * COMPACTION_SMALL_SEGMENT_SHARE) as u64;
+        let ceiling = (total as f64 * COMPACTION_SMALL_SEGMENT_SHARE).ceil() as u64;
         Ok(segments
             .iter()
             .skip(keep_largest)
@@ -2739,6 +2750,20 @@ fn add_optional_text(doc: &mut TantivyDocument, field: Field, value: &Option<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_payload_fields_are_stored_without_indexing() {
+        let schema = build_schema().unwrap();
+        for name in ["tool_input", "tool_output"] {
+            let field = schema.get_field(name).unwrap();
+            let entry = schema.get_field_entry(field);
+            assert!(entry.is_stored(), "{name} must remain retrievable");
+            assert!(
+                !entry.is_indexed(),
+                "{name} must not duplicate the text vocabulary"
+            );
+        }
+    }
     use tantivy::schema::TEXT;
 
     fn test_record(doc_id: u64, text: &str) -> Record {
@@ -2814,6 +2839,30 @@ mod tests {
         assert_eq!(index.segment_count().unwrap(), 2);
         assert_eq!(index.doc_count().unwrap(), 46);
         assert_eq!(index.compact_small_segments(1).unwrap(), 0);
+    }
+
+    #[test]
+    fn compaction_includes_one_document_below_five_percent() {
+        for total in [20, 21, 39, 40] {
+            let temp = tempfile::tempdir().unwrap();
+            let index = SearchIndex::open_or_create_for_search_refresh(temp.path()).unwrap();
+            let mut writer = index.writer_for_ingest(Some(1024)).unwrap();
+            for id in 0..total - 1 {
+                index
+                    .add_record(&mut writer, &test_record(id, "large"))
+                    .unwrap();
+            }
+            writer.commit().unwrap();
+            index
+                .add_record(&mut writer, &test_record(total, "small"))
+                .unwrap();
+            writer.commit().unwrap();
+            writer.wait_merging_threads().unwrap();
+            assert_eq!(
+                index.small_segment_count(1).unwrap(),
+                usize::from(total > 20)
+            );
+        }
     }
 
     #[test]
@@ -3646,6 +3695,24 @@ mod tests {
             .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
             .count();
         assert_eq!(generation_count, 1);
+    }
+
+    #[test]
+    fn legacy_gc_dry_run_does_not_create_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = Index::create_in_dir(temp.path(), build_schema().unwrap()).unwrap();
+        drop(index);
+        let before = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<HashSet<_>>();
+        let report = SearchIndex::garbage_collect_generations_offline(temp.path(), true).unwrap();
+        assert!(report.dry_run);
+        let after = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<HashSet<_>>();
+        assert_eq!(before, after);
     }
 
     #[test]
