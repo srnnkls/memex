@@ -2545,8 +2545,9 @@ fn ensure_local_index(paths: &Paths, config: &UserConfig) -> Result<()> {
 }
 
 /// Search refreshes append without merging; once segments accumulate, one detached
-/// `memex index` process compacts them with the tiered policy and exits. Skipped while
-/// another ingest holds the lease, so at most one compaction runs at a time.
+/// `memex index` process compacts them with the tiered policy and exits. The probe skips
+/// spawning while ingest is busy; duplicate children serialize on the ingest lease they
+/// acquire for their entire run.
 fn schedule_compaction_if_fragmented(paths: &Paths) -> Result<()> {
     let segments = SearchIndex::open_or_create(&paths.index)?.segment_count()?;
     if segments <= crate::index::SEARCH_REFRESH_COMPACTION_SEGMENTS {
@@ -2586,7 +2587,7 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
             _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
         }
     } else {
-        SearchIndex::open_or_create_for_ingest(&paths.index)?
+        SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?
     };
     let options = IngestOptions {
         claude_sources: default_claude_sources(),
