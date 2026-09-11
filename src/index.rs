@@ -2538,6 +2538,20 @@ fn add_optional_text(doc: &mut TantivyDocument, field: Field, value: &Option<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_payload_fields_are_stored_without_indexing() {
+        let schema = build_schema().unwrap();
+        for name in ["tool_input", "tool_output"] {
+            let field = schema.get_field(name).unwrap();
+            let entry = schema.get_field_entry(field);
+            assert!(entry.is_stored(), "{name} must remain retrievable");
+            assert!(
+                !entry.is_indexed(),
+                "{name} must not duplicate the text vocabulary"
+            );
+        }
+    }
     use tantivy::schema::TEXT;
 
     fn test_record(doc_id: u64, text: &str) -> Record {
