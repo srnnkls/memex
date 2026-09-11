@@ -240,7 +240,7 @@ EXAMPLES:
         #[command(flatten)]
         index: IndexArgs,
     },
-    /// Merge every searchable segment but the largest few into one
+    /// Merge segments below 5% of the corpus, excluding the three largest
     #[command(hide = true)]
     IndexCompact {
         /// Path to memex data directory [default: ~/.memex]
@@ -2208,7 +2208,10 @@ fn run_index_selection(
     let index = if reindex {
         SearchIndex::open_or_create_for_ingest(&paths.index)?
     } else {
-        SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?
+        match SearchIndex::open_or_create(&paths.index) {
+            Ok(index) if !index.is_writable() => index,
+            _ => SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?,
+        }
     };
 
     let (report, full_scan) = if let Some(dirty) = dirty {
@@ -7395,7 +7398,7 @@ fn format_ts(ts: u64) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
+pub(crate) fn query_literals(query: &str) -> Vec<String> {
     use tantivy::query_grammar::{Occur, UserInputAst, UserInputLeaf};
     fn literals(ast: &UserInputAst, terms: &mut Vec<String>) {
         match ast {
@@ -7434,13 +7437,20 @@ pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
         if term.is_empty() || !seen.insert(term.clone()) {
             continue;
         }
-        out.push(
-            RegexBuilder::new(&regex::escape(&term))
-                .case_insensitive(true)
-                .build()?,
-        );
+        out.push(term);
     }
-    Ok(out)
+    out
+}
+
+pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
+    query_literals(query)
+        .into_iter()
+        .map(|term| {
+            Ok(RegexBuilder::new(&regex::escape(&term))
+                .case_insensitive(true)
+                .build()?)
+        })
+        .collect()
 }
 
 // Preview the earliest literal hit; semantic-only hits fall back to a compact prefix.

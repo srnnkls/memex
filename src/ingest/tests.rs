@@ -1,3 +1,16 @@
+use super::discovery::{
+    FILE_IDENTITY_PREFIX_BYTES, changed_ns, discovered_metadata, file_identity, modified_ns,
+    prepare_refresh, unchanged_file_metadata,
+};
+use super::execution::{
+    RecordSender, build_parser_thread_pool, execute_refresh, finish_file_task, parse_claude_file,
+    parse_codex_session, parse_copilot_session, parse_pi_file, record_channel,
+};
+use super::publication::{
+    open_vector_index_for_ingest, prepare_pending_ingest_recovery, recover_checkpoint,
+};
+use crate::analytics::backfill_from_index;
+
 fn run_writer_fixture(
     index: SearchIndex,
     writer: tantivy::IndexWriter,
@@ -966,6 +979,94 @@ fn cancelled_writer_does_not_publish_staged_records() {
         .expect("analytics sessions");
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].source_path, "source-1.jsonl");
+}
+
+#[test]
+fn checkpoint_only_writer_skips_embedding_initialization() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let mut writer = index.writer().unwrap();
+    index
+        .add_record(&mut writer, &record(1, "user", "existing"))
+        .unwrap();
+    writer.commit().unwrap();
+    writer.wait_merging_threads().unwrap();
+    index.publish_generation().unwrap();
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let generation = fs::read(paths.index.join("CURRENT")).unwrap();
+    let (records, rx) = unbounded();
+    drop(records);
+    let (decision, decisions) = bounded(1);
+    decision.send(WriterDecision::Commit).unwrap();
+    let outcome = writer_loop(
+        index,
+        rx,
+        decisions,
+        Vec::new(),
+        WriterContext {
+            index_root: paths.index.clone(),
+            defer_merges: false,
+            input_bytes: Some(0),
+            embeddings: true,
+            do_backfill_embeddings: false,
+            reset_vector_store: false,
+            vector_dir: paths.vectors.clone(),
+            analytics_path: analytics_path(&paths.state),
+            progress: Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], true)),
+            model: ModelChoice::Gemma,
+            embed_runtime: EmbedRuntimeConfig::default(),
+            tool_content_limits: IndexedToolContentLimits::default(),
+            reconcile_vector_ids: false,
+            scope_targets: Vec::new(),
+            opencode_session_cwds: HashMap::new(),
+            repositories: Arc::new(crate::repository::RepositoryResolver::default()),
+            codex_metadata_checkpoints: HashMap::new(),
+            vector_delete_paths: HashSet::new(),
+        },
+    )
+    .unwrap();
+    assert_eq!(outcome, WriterOutcome::CheckpointsOnly);
+    assert_eq!(fs::read(paths.index.join("CURRENT")).unwrap(), generation);
+    assert!(!VectorIndex::exists(&paths.vectors));
+}
+
+#[test]
+fn replacing_transcript_removes_its_old_vectors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    let transcript = source.join("session.jsonl");
+    append_claude_message(&transcript, "original");
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let mut options = ingest_options(false, ModelChoice::Gemma);
+    options.claude_sources = vec![source];
+    let lease = ingest_lease(&paths);
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let mut ids = Vec::new();
+    index
+        .for_each_record(|record| {
+            ids.push(record.doc_id);
+            Ok(())
+        })
+        .unwrap();
+    let mut vectors = VectorIndex::open_or_create(&paths.vectors, 256, Some("potion")).unwrap();
+    for id in &ids {
+        vectors.add(*id, &vec![0.1; 256]).unwrap();
+    }
+    vectors.save().unwrap();
+    drop(vectors);
+    fs::remove_file(&transcript).unwrap();
+    append_claude_message(&transcript, "replacement");
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let vectors = VectorIndex::open(&paths.vectors).unwrap();
+    assert!(ids.iter().all(|id| !vectors.contains(*id)));
+    assert_eq!(indexed_texts(&paths), ["replacement"]);
 }
 
 #[test]
@@ -3598,6 +3699,13 @@ fn targeted_ingest_escalates_pending_publication_to_full_recovery() {
     let lease = ingest_lease(&paths);
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
     ingest_all(&paths, &index, &options, &lease).unwrap();
+    let db = analytics_path(&paths.state);
+    let mut analytics = AnalyticsWriter::open(&db).unwrap();
+    analytics
+        .record(&record(999, "user", "unpublished orphan"))
+        .unwrap();
+    analytics.flush().unwrap();
+    AnalyticsStore::open(&db).unwrap().mark_complete().unwrap();
     append_claude_message(&first, "first appended");
     append_claude_message(&second, "second missed event");
     let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
@@ -3629,6 +3737,11 @@ fn targeted_ingest_escalates_pending_publication_to_full_recovery() {
             .unwrap()
             .is_none()
     );
+    let rows = AnalyticsStore::open_read_only(&db)
+        .unwrap()
+        .query_sessions_detailed(None, None, None, None, None)
+        .unwrap();
+    assert!(rows.iter().all(|row| row.source_path != "source-999.jsonl"));
 }
 
 #[test]

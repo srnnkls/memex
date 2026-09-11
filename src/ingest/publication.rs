@@ -25,7 +25,8 @@ pub(super) fn writer_loop(
     if first.is_none()
         && delete_paths.is_empty()
         && ctx.scope_targets.is_empty()
-        && !ctx.embeddings
+        && !ctx.do_backfill_embeddings
+        && !ctx.reset_vector_store
         && !ctx.reconcile_vector_ids
     {
         return match decision_rx.recv() {
