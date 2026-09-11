@@ -2266,8 +2266,11 @@ fn build_schema_with_options(
     builder.add_text_field("role", STRING | STORED);
     builder.add_text_field("source", session_identity_options.clone());
 
+    // `en_stem` lowercases and applies the English Snowball stemmer, so a query for
+    // "migration" also matches "migrations" and "migrated". Existing indexes keep the
+    // tokenizer recorded in their on-disk schema until `memex index rebuild`.
     let text_indexing = TextFieldIndexing::default()
-        .set_tokenizer("default")
+        .set_tokenizer("en_stem")
         .set_index_option(IndexRecordOption::WithFreqsAndPositions);
     let text_options = TextOptions::default()
         .set_indexing_options(text_indexing)
@@ -3535,6 +3538,22 @@ mod tests {
         let new_reader = SearchIndex::open_or_create(tmp.path()).expect("new reader");
         assert_eq!(search_text_count(&new_reader, "beforeupdate"), 0);
         assert_eq!(search_text_count(&new_reader, "afterupdate"), 1);
+    }
+
+    #[test]
+    fn text_search_matches_inflected_forms_through_stemming() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let mut writer = index.writer().expect("writer");
+        index
+            .add_record(&mut writer, &test_record(1, "ran the database migrations"))
+            .expect("add record");
+        writer.commit().expect("commit");
+
+        assert_eq!(search_text_count(&index, "migration"), 1);
+        assert_eq!(search_text_count(&index, "migrated"), 1);
+        assert_eq!(search_text_count(&index, "Databases"), 1);
+        assert_eq!(search_text_count(&index, "rollback"), 0);
     }
 
     fn search_text_count(index: &SearchIndex, query: &str) -> usize {
