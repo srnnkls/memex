@@ -153,18 +153,6 @@ fn explicit_incremental_indexing_preserves_segments_until_bulk_rebuild() {
         );
         appended_segments = segments;
     }
-    // Compaction runs in a detached child, so drive it directly rather than racing it.
-    assert!(run_compact(temp.path(), &root).status.success());
-    let compacted = SearchIndex::open_or_create(&root.join("index"))
-        .unwrap()
-        .index
-        .searchable_segment_ids()
-        .unwrap();
-    assert!(
-        compacted.len() < appended_segments.len(),
-        "tiny peer segments were never compacted"
-    );
-    assert!(seed_segments.iter().all(|id| compacted.contains(id)));
     let current = fs::read(root.join("index/CURRENT")).unwrap();
     assert!(run_index(temp.path(), &root, false).status.success());
     assert_eq!(fs::read(root.join("index/CURRENT")).unwrap(), current);
@@ -178,7 +166,7 @@ fn explicit_incremental_indexing_preserves_segments_until_bulk_rebuild() {
     let rebuilt = SearchIndex::open_or_create(&root.join("index")).unwrap();
     let segments = rebuilt.index.searchable_segment_ids().unwrap();
     assert_eq!(segments.len(), 1);
-    assert!(segments.iter().all(|id| !compacted.contains(id)));
+    assert!(segments.iter().all(|id| !appended_segments.contains(id)));
     assert_eq!(rebuilt.doc_count().unwrap(), expected.len());
     assert_eq!(
         rebuilt
@@ -188,6 +176,78 @@ fn explicit_incremental_indexing_preserves_segments_until_bulk_rebuild() {
             .map(|record| record.text)
             .collect::<BTreeSet<_>>(),
         expected
+    );
+}
+
+#[test]
+fn compaction_folds_the_tiny_segments_search_refreshes_leave_behind() {
+    use memex::index::SearchIndex;
+    use std::io::Write;
+
+    let temp = fixture();
+    let root = temp.path().join("index");
+    let source = temp
+        .path()
+        .join(".claude/projects/private-project/private-session.jsonl");
+    {
+        let mut file = fs::OpenOptions::new().append(true).open(&source).unwrap();
+        for seed in 1..128 {
+            let record = serde_json::json!({
+                "type": "user",
+                "uuid": format!("private-seed-{seed}"),
+                "timestamp": "2026-09-01T00:00:00Z",
+                "message": {"role": "user", "content": format!("privateneedle seed-{seed}")},
+            });
+            writeln!(file, "{record}").unwrap();
+        }
+    }
+    for append in 0..=5 {
+        if append > 0 {
+            let record = serde_json::json!({
+                "type": "user",
+                "uuid": format!("private-event-{append}"),
+                "timestamp": "2026-09-01T00:00:00Z",
+                "message": {"role": "user", "content": format!("privateneedle update-{append}")},
+            });
+            writeln!(
+                fs::OpenOptions::new().append(true).open(&source).unwrap(),
+                "{record}"
+            )
+            .unwrap();
+        }
+        let output = run(temp.path(), &root, None, "privateneedle");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let fragmented = SearchIndex::open_or_create(&root.join("index"))
+        .unwrap()
+        .index
+        .searchable_segment_ids()
+        .unwrap();
+    assert_eq!(fragmented.len(), 6);
+
+    let output = run_compact(temp.path(), &root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let index = SearchIndex::open_or_create(&root.join("index")).unwrap();
+    let compacted = index.index.searchable_segment_ids().unwrap();
+    assert!(
+        compacted.len() < fragmented.len(),
+        "tiny peer segments were never compacted"
+    );
+    assert_eq!(index.doc_count().unwrap(), 133);
+    assert_eq!(
+        compacted
+            .iter()
+            .filter(|id| fragmented.contains(id))
+            .count(),
+        compacted.len() - 1
     );
 }
 
