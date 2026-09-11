@@ -78,6 +78,7 @@ pub struct SearchIndex {
     _generation_lease: Option<Arc<GenerationLease>>,
     incremental_merge_policy: bool,
     defer_merges: bool,
+    bulk_rebuild: bool,
     shared_reader: Arc<OnceLock<IndexReader>>,
 }
 
@@ -85,6 +86,10 @@ const GENERATIONS_DIR: &str = "generations";
 const CURRENT_FILE: &str = "CURRENT";
 const GENERATION_LEASE_FILE: &str = ".lease";
 const SMALL_INGEST_MAX_BYTES: u64 = 1024 * 1024;
+/// Rebuild arena across tantivy's indexing threads; bigger arenas flush fewer, larger segments.
+const REBUILD_MEMORY_BUDGET_BYTES: usize = 1 << 30;
+/// A rebuild publishes at most this many segments; equal-sized groups merge in parallel.
+pub const REBUILD_TARGET_SEGMENTS: usize = 8;
 const CONTINUOUS_MAX_SEGMENTS: usize = 4096;
 /// Segment count above which a search-triggered refresh schedules background compaction.
 pub const SEARCH_REFRESH_COMPACTION_SEGMENTS: usize = 8;
@@ -557,6 +562,54 @@ impl SearchIndex {
         Ok(index)
     }
 
+    /// A rebuild writes every segment with no merges and a large arena, then folds the result
+    /// into at most [`REBUILD_TARGET_SEGMENTS`] segments with parallel merges before publishing.
+    pub fn open_or_create_for_rebuild(dir: &Path) -> Result<Self> {
+        let mut index = Self::open_or_create_for_ingest_with_merge_policy(dir, false)?;
+        index.defer_merges = true;
+        index.bulk_rebuild = true;
+        Ok(index)
+    }
+
+    /// Merges the committed segments into at most `max_segments`, balancing groups by document
+    /// count and running them on tantivy's merge threads concurrently. Returns the number of
+    /// merges issued.
+    pub fn merge_into_at_most(
+        &self,
+        writer: &mut IndexWriter,
+        max_segments: usize,
+    ) -> Result<usize> {
+        crate::profiling::span!("lexical.rebuild_merge");
+        let mut metas = self.index.searchable_segment_metas()?;
+        if metas.len() <= max_segments.max(1) {
+            return Ok(0);
+        }
+        metas.sort_by_key(|meta| std::cmp::Reverse(meta.num_docs()));
+        let mut groups: Vec<(u64, Vec<SegmentId>)> = vec![(0, Vec::new()); max_segments.max(1)];
+        for meta in metas {
+            let group = groups
+                .iter_mut()
+                .min_by_key(|(docs, _)| *docs)
+                .expect("at least one group");
+            group.0 += u64::from(meta.num_docs());
+            group.1.push(meta.id());
+        }
+        let merges = groups
+            .into_iter()
+            .filter(|(_, ids)| ids.len() >= 2)
+            .map(|(_, ids)| writer.merge(&ids))
+            .collect::<Vec<_>>();
+        let issued = merges.len();
+        for merge in merges {
+            merge.wait()?;
+        }
+        Ok(issued)
+    }
+
+    pub fn is_bulk_rebuild(&self) -> bool {
+        self.bulk_rebuild
+    }
+
     pub fn segment_count(&self) -> Result<usize> {
         Ok(self.index.searchable_segment_metas()?.len())
     }
@@ -647,6 +700,7 @@ impl SearchIndex {
             if schema_is_current(&existing.schema())
                 && existing.schema().get_field("reader_metadata").is_ok()
             {
+                check_term_dictionary_format(&existing, &load_fields(existing.schema())?, dir)?;
                 existing
             } else {
                 drop(existing);
@@ -665,6 +719,7 @@ impl SearchIndex {
             _generation_lease: None,
             incremental_merge_policy,
             defer_merges: false,
+            bulk_rebuild: false,
             shared_reader: Arc::new(OnceLock::new()),
         })
     }
@@ -687,6 +742,7 @@ impl SearchIndex {
                 _generation_lease: None,
                 incremental_merge_policy: false,
                 defer_merges: false,
+                bulk_rebuild: false,
                 shared_reader: Arc::new(OnceLock::new()),
             })
         } else {
@@ -715,6 +771,8 @@ impl SearchIndex {
         let writer = if input_bytes.is_some_and(|bytes| bytes <= SMALL_INGEST_MAX_BYTES) {
             crate::profiling::count!("lexical.single_thread_batches", 1);
             self.index.writer_with_num_threads(1, 64_000_000)?
+        } else if self.bulk_rebuild {
+            self.index.writer(REBUILD_MEMORY_BUDGET_BYTES)?
         } else {
             self.index.writer(256_000_000)?
         };
@@ -2033,6 +2091,24 @@ fn stale_schema_error(dir: &Path) -> anyhow::Error {
     )
 }
 
+/// Term dictionaries are SSTables; an index written with tantivy's FST dictionaries fails
+/// only when a segment is first searched, from a worker thread, with an opaque message.
+/// Probing one segment's dictionary at open time turns that into a rebuild instruction.
+fn check_term_dictionary_format(index: &Index, fields: &IndexFields, dir: &Path) -> Result<()> {
+    let Some(segment) = index.searchable_segment_metas()?.into_iter().next() else {
+        return Ok(());
+    };
+    let reader = tantivy::SegmentReader::open(&index.segment(segment))?;
+    match reader.inverted_index(fields.text) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("dictionary type") => Err(anyhow!(
+            "index at {} uses term dictionaries this build cannot read; run `memex index rebuild`",
+            dir.display()
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn create_index_in_dir(dir: &Path) -> Result<SearchIndex> {
     let schema = build_schema()?;
     let index = Index::create_in_dir(dir, schema.clone())?;
@@ -2046,6 +2122,7 @@ fn create_index_in_dir(dir: &Path) -> Result<SearchIndex> {
         _generation_lease: None,
         incremental_merge_policy: false,
         defer_merges: false,
+        bulk_rebuild: false,
         shared_reader: Arc::new(OnceLock::new()),
     })
 }
@@ -2068,6 +2145,7 @@ fn open_sealed_generation(dir: &Path) -> Result<SearchIndex> {
         return Err(stale_schema_error(dir));
     }
     let fields = load_fields(index.schema())?;
+    check_term_dictionary_format(&index, &fields, dir)?;
     Ok(SearchIndex {
         index,
         fields,
@@ -2077,6 +2155,7 @@ fn open_sealed_generation(dir: &Path) -> Result<SearchIndex> {
         _generation_lease: Some(generation_lease),
         incremental_merge_policy: false,
         defer_merges: false,
+        bulk_rebuild: false,
         shared_reader: Arc::new(OnceLock::new()),
     })
 }

@@ -46,6 +46,8 @@ Malformed references, unsupported versions, traversal paths, missing referenced 
 
 ## Compatibility
 
+Term dictionaries are tantivy SSTables (the `quickwit` feature), not FSTs: building them is a fraction of the FST cost and merges follow. An index whose segments carry FST dictionaries is refused at open with an instruction to run `memex index rebuild`; older binaries cannot read SSTable dictionaries. The dictionary format is checked on the first segment when a generation is opened.
+
 Old flat and full-directory indexes remain readable. Their committed files are adopted once when migration is published; the first migration can be slower than a steady-state update. Explicit indexing may publish this format upgrade even when no records changed.
 
 Older binaries cannot read the shared-reference layout. Upgrade every process using an index before migrating it. Do not roll back to an older binary against a migrated index; restore a pre-migration snapshot or rebuild using the older version.

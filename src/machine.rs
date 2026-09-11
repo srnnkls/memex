@@ -2620,7 +2620,7 @@ fn ensure_local_index(paths: &Paths, config: &UserConfig) -> Result<()> {
 /// `memex index compact` process folds the small ones into one segment and exits. The spawn
 /// is skipped while an ingest holds the lease, and the child takes a compaction lock, so a
 /// second child started in the gap exits instead of merging the same segments again.
-fn schedule_compaction_if_fragmented(paths: &Paths) -> Result<()> {
+pub(crate) fn schedule_compaction_if_fragmented(paths: &Paths) -> Result<()> {
     let small = SearchIndex::open_or_create(&paths.index)?
         .small_segment_count(crate::index::COMPACTION_RETAINED_SEGMENTS)?;
     if small <= crate::index::SEARCH_REFRESH_COMPACTION_SEGMENTS {

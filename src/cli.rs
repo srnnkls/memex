@@ -2207,9 +2207,9 @@ fn run_index_selection(
     }
     paths.ensure_dirs()?;
     let index = if reindex {
-        SearchIndex::open_or_create_for_ingest(&paths.index)?
+        SearchIndex::open_or_create_for_rebuild(&paths.index)?
     } else {
-        SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?
+        SearchIndex::open_or_create_for_search_refresh(&paths.index)?
     };
 
     let (report, full_scan) = if let Some(dirty) = dirty {
@@ -2237,6 +2237,10 @@ fn run_index_selection(
             "parser diagnostics:\n{}",
             serde_json::to_string_pretty(&report.diagnostics)?
         );
+    }
+    drop(lease);
+    if !reindex && report.records_added > 0 {
+        crate::machine::schedule_compaction_if_fragmented(&paths)?;
     }
     Ok(full_scan)
 }

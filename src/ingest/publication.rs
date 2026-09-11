@@ -226,6 +226,9 @@ pub(super) fn writer_loop(
     if let Some(handle) = embedder.take() {
         std::mem::forget(handle);
     }
+    if index.is_bulk_rebuild() {
+        index.merge_into_at_most(&mut writer, crate::index::REBUILD_TARGET_SEGMENTS)?;
+    }
     {
         crate::profiling::span!("lexical.merge_wait");
         writer.wait_merging_threads()?;
