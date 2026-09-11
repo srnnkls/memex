@@ -2724,7 +2724,7 @@ fn updating_scan_cache_replaces_malformed_cache() {
     let lease = ingest_lease(&paths);
     let mut state =
         CheckpointSession::open(&paths.state.join("ingest.json"), &lease, true, None).unwrap();
-    let cache = updated_scan_cache(Some(std::mem::take(&mut state.scan_cache)), 7, 42);
+    let cache = updated_scan_cache(Some(std::mem::take(&mut state.scan_cache)), 7, 42, true);
     state
         .commit_final(cache, PendingChange::Keep)
         .expect("update scan cache");

@@ -175,7 +175,7 @@ pub(super) fn discover_transcripts(
 /// Directory stamps are only reusable while the roots and filters that produced them hold.
 fn discovery_fingerprint(options: &IngestOptions) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"memex-directory-stamps-v1");
+    hash.update(b"memex-directory-stamps-v2");
     let mut feed = |bytes: &[u8]| {
         hash.update((bytes.len() as u64).to_le_bytes());
         hash.update(bytes);
@@ -213,11 +213,6 @@ fn discovery_fingerprint(options: &IngestOptions) -> String {
     }
     format!("{:x}", hash.finalize())
 }
-
-/// Files whose last committed mtime falls inside this window are stat-checked on every
-/// journal-narrowed refresh. The journal lags the kernel by a few tens of milliseconds, so a
-/// transcript being appended right now may not be in the replay yet.
-pub(super) const JOURNAL_HOT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// Start replaying the file-system event journal from the cursor persisted by the last
 /// committed refresh, on its own thread, before the checkpoint is opened.
@@ -260,8 +255,13 @@ fn journal_hints(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs()
-                .saturating_sub(JOURNAL_HOT_WINDOW.as_secs()) as i64;
-            paths.extend(state.hot_file_keys(since)?.into_iter().map(PathBuf::from));
+                .saturating_sub(crate::watch::HOT_WINDOW.as_secs()) as i64;
+            paths.extend(
+                state
+                    .sweep_candidate_keys(since)?
+                    .into_iter()
+                    .map(PathBuf::from),
+            );
             crate::profiling::count!("journal.hints", paths.len());
             Some(paths)
         }
@@ -1019,6 +1019,7 @@ pub(super) fn prepare_refresh(
         None
     };
     let mut journal_cursor = None;
+    let mut journal_narrowed = false;
     let selected = match (selected, journal) {
         (None, Some(journal))
             if dirty.is_none()
@@ -1033,6 +1034,7 @@ pub(super) fn prepare_refresh(
                 Some(hints) => match selection::resolve_dirty(options, &hints, &state)? {
                     selection::DirtySelection::Paths { files, databases } => {
                         crate::profiling::count!("journal.narrowed_refreshes", 1);
+                        journal_narrowed = true;
                         Some((files, databases))
                     }
                     selection::DirtySelection::Resync => None,
@@ -1074,7 +1076,9 @@ pub(super) fn prepare_refresh(
     let mut files_scanned = 0usize;
     let mut files_skipped = 0usize;
     let mut total_bytes = 0u64;
-    if !full_scan {
+    // A dirty-set refresh sees only what it was handed; the others cover the whole interval
+    // and may re-arm the scan-cache TTL.
+    if !(full_scan || journal_narrowed) {
         scan_cache = None;
     } else if scan_cache.is_none() {
         scan_cache = Some(std::mem::take(&mut state.scan_cache));

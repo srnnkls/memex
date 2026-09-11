@@ -14,6 +14,9 @@ pub struct DirectoryStamp {
     pub inode: u64,
     pub mtime_secs: i64,
     pub mtime_nanos: i64,
+    /// Tools that preserve timestamps restore mtime after changing entries; ctime still moves.
+    pub ctime_secs: i64,
+    pub ctime_nanos: i64,
 }
 
 impl DirectoryStamp {
@@ -25,6 +28,8 @@ impl DirectoryStamp {
             inode: metadata.ino(),
             mtime_secs: metadata.mtime(),
             mtime_nanos: metadata.mtime_nsec(),
+            ctime_secs: metadata.ctime(),
+            ctime_nanos: metadata.ctime_nsec(),
         }
     }
 
@@ -39,6 +44,8 @@ impl DirectoryStamp {
             inode: 0,
             mtime_secs: modified.map_or(0, |d| d.as_secs() as i64),
             mtime_nanos: modified.map_or(0, |d| d.subsec_nanos() as i64),
+            ctime_secs: 0,
+            ctime_nanos: 0,
         }
     }
 }
@@ -320,6 +327,37 @@ mod tests {
         assert_eq!(files, vec![root.join("a/deep/er/four.jsonl")]);
         let update = second.finish("fp".into());
         assert_eq!(update.upserts.len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_added_under_a_restored_mtime_is_still_enumerated() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("projects");
+        touch(&root.join("a/one.jsonl"), "1");
+        let mut first = StampedWalk::new(HashMap::new(), []);
+        let known = sorted(first.files(&root));
+        let update = first.finish("fp".into());
+        let before = fs::metadata(root.join("a")).unwrap();
+        settle();
+
+        touch(&root.join("a/two.jsonl"), "2");
+        let restored = fs::FileTimes::new()
+            .set_accessed(before.accessed().unwrap())
+            .set_modified(before.modified().unwrap());
+        fs::File::options()
+            .write(true)
+            .open(root.join("a"))
+            .or_else(|_| fs::File::open(root.join("a")))
+            .unwrap()
+            .set_times(restored)
+            .unwrap();
+
+        let mut second = StampedWalk::new(stamps(&update), known);
+        assert!(
+            sorted(second.files(&root)).contains(&root.join("a/two.jsonl")),
+            "a restored mtime must not certify changed entries"
+        );
     }
 
     #[cfg(unix)]
