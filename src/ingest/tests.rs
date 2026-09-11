@@ -1,3 +1,14 @@
+use super::discovery::{
+    FILE_IDENTITY_PREFIX_BYTES, changed_ns, discovered_metadata, file_identity, modified_ns,
+    unchanged_file_metadata,
+};
+use super::execution::{
+    RecordSender, build_parser_thread_pool, finish_file_task, parse_claude_file,
+    parse_codex_session, parse_copilot_session, parse_pi_file, record_channel,
+};
+use super::publication::{open_vector_index_for_ingest, prepare_pending_ingest_recovery};
+use crate::analytics::backfill_from_index;
+
 fn run_writer_fixture(
     index: SearchIndex,
     writer: tantivy::IndexWriter,
