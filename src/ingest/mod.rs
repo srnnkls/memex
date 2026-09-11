@@ -1,13 +1,26 @@
-mod execution;
-mod publication;
-use discovery::*;
-pub(crate) use discovery::{PathExcluder, build_path_excluder};
-use execution::*;
-use publication::*;
 mod discovery;
+mod execution;
 mod plan;
+mod publication;
 mod selection;
-use crate::analytics::{AnalyticsStore, AnalyticsWriter, analytics_path, backfill_from_index};
+
+pub(crate) use discovery::{PathExcluder, build_path_excluder};
+use discovery::{
+    can_skip_fresh_scan, can_skip_noop_index, is_not_found, vector_index_covers_embeddable_records,
+    vector_migration,
+};
+use execution::{
+    cleanup_opencode_spools, flush_embeddings, is_embedding_role, limit_record_tool_content,
+    parser_thread_pool, prehydrate_opencode_database, refresh_memories, truncate_for_embedding,
+};
+use publication::{
+    finalize_pending_ingest, pending_ingest_path, pending_scope_union, update_scan_cache,
+    writer_loop,
+};
+
+use crate::analytics::{
+    AnalyticsStore, AnalyticsWriter, analytics_path, backfill_from_index_with_repositories,
+};
 use crate::config::{IndexedToolContentLimits, Paths};
 use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::SearchIndex;

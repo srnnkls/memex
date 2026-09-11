@@ -2175,7 +2175,15 @@ pub fn backfill_from_index(
     path: impl AsRef<Path>,
     index: &crate::index::SearchIndex,
 ) -> Result<()> {
-    let mut writer = AnalyticsWriter::open(path)?;
+    backfill_from_index_with_repositories(path, index, Arc::new(RepositoryResolver::default()))
+}
+
+pub(crate) fn backfill_from_index_with_repositories(
+    path: impl AsRef<Path>,
+    index: &crate::index::SearchIndex,
+    repositories: Arc<RepositoryResolver>,
+) -> Result<()> {
+    let mut writer = AnalyticsWriter::with_repositories(path, repositories)?;
     writer.clear()?;
     index
         .for_each_record(|record| {
