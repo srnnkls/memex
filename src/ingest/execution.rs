@@ -1228,7 +1228,8 @@ pub(super) fn execute_refresh(
         embeddings,
         do_backfill_embeddings: options.backfill_embeddings
             || vector_migration.rebuild
-            || recover_embeddings,
+            || recover_embeddings
+            || (embeddings && vector_work),
         reset_vector_store: vector_migration.rebuild,
         vector_dir: paths.vectors.clone(),
         analytics_path: analytics_db.clone(),
