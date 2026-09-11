@@ -3260,6 +3260,8 @@ fn collect_search_with_auto_index(
         top_n_per_session
     };
     let kind_filter: crate::analytics::SessionKindFilter = origin.into();
+    // `--full` clears the field set and asks for whole records; everything else renders excerpts.
+    let text_limit = fields.as_ref().map(|_| crate::machine::SEARCH_TEXT_BUDGET);
     let render = RenderOptions {
         verbose,
         pretty: false,
@@ -3317,7 +3319,7 @@ fn collect_search_with_auto_index(
                 recency_half_life_days,
                 min_score,
                 project_grouping: None,
-                text_limit: None,
+                text_limit,
             };
             let federated = federated_search(
                 &paths,

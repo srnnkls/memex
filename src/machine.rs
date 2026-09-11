@@ -44,6 +44,9 @@ pub enum SearchMode {
     Hybrid,
 }
 
+/// Must exceed every preview window callers render, so a capped record centres the same match.
+pub const SEARCH_TEXT_BUDGET: usize = 2_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchSpec {
     pub query: String,
@@ -2565,6 +2568,19 @@ fn apply_project_grouping(
     }
 }
 
+/// Lowercasing can change a character's byte length, so an offset into the lowercased string
+/// does not index the original.
+fn chars_before_lowercase(field: &str, lower_byte: usize) -> usize {
+    let mut lowered = 0;
+    for (index, character) in field.chars().enumerate() {
+        if lowered >= lower_byte {
+            return index;
+        }
+        lowered += character.to_lowercase().map(char::len_utf8).sum::<usize>();
+    }
+    field.chars().count()
+}
+
 /// Keep `limit` characters of `field`: from the start, or from the first occurrence of a query
 /// term when every term lies beyond the first `limit` characters.
 fn abbreviate_field(field: &mut String, limit: usize, terms: &[String]) {
@@ -2577,13 +2593,9 @@ fn abbreviate_field(field: &mut String, limit: usize, terms: &[String]) {
         .filter(|term| !term.is_empty())
         .filter_map(|term| lower.find(term.as_str()))
         .min();
-    let start_byte = match first_hit {
-        Some(byte) if lower[..byte].chars().count() >= limit => {
-            // `lower` and `field` share char boundaries only when lowercasing preserves
-            // lengths; recompute the start on `field` by char count to stay on a boundary.
-            let chars_before = lower[..byte].chars().count();
-            let keep_before = limit / 4;
-            let skip = chars_before.saturating_sub(keep_before);
+    let start_byte = match first_hit.map(|byte| (byte, chars_before_lowercase(field, byte))) {
+        Some((_, chars_before)) if chars_before >= limit => {
+            let skip = chars_before.saturating_sub(limit / 4);
             field.char_indices().nth(skip).map_or(0, |(index, _)| index)
         }
         _ => 0,
@@ -2976,6 +2988,28 @@ mod abbreviate_tests {
         let mut unicode = "é".repeat(50);
         abbreviate_field(&mut unicode, 10, &[]);
         assert_eq!(unicode, format!("{}…", "é".repeat(10)));
+    }
+
+    #[test]
+    fn a_prefix_that_grows_when_lowercased_still_keeps_the_query_window() {
+        let terms = vec!["needle".to_string()];
+
+        // `İ` lowercases to two characters, so the hit's offset in the lowercased string
+        // overshoots the original.
+        let mut turkish = format!("{}needle tail", "İ".repeat(100));
+        abbreviate_field(&mut turkish, 40, &terms);
+        assert!(turkish.contains("needle"), "{turkish}");
+        assert!(turkish.starts_with('…'));
+        assert!(turkish.chars().count() <= 42, "{}", turkish.chars().count());
+
+        // Final sigma lowercases to a different character of the same width.
+        let mut greek = format!("{}needle tail", "Σ".repeat(100));
+        abbreviate_field(&mut greek, 40, &terms);
+        assert!(greek.contains("needle"), "{greek}");
+
+        let mut mixed = format!("{}needle", "İa".repeat(60));
+        abbreviate_field(&mut mixed, 30, &terms);
+        assert!(mixed.contains("needle"), "{mixed}");
     }
 }
 
