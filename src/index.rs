@@ -86,8 +86,8 @@ const CURRENT_FILE: &str = "CURRENT";
 const GENERATION_LEASE_FILE: &str = ".lease";
 const SMALL_INGEST_MAX_BYTES: u64 = 1024 * 1024;
 const CONTINUOUS_MAX_SEGMENTS: usize = 4096;
-/// Segment count above which a search-triggered refresh schedules background compaction.
-pub const SEARCH_REFRESH_COMPACTION_SEGMENTS: usize = 8;
+/// Small-segment count above which a search-triggered refresh schedules background compaction.
+pub const SEARCH_REFRESH_COMPACTION_SMALL_SEGMENTS: usize = 8;
 /// Largest segments a background compaction leaves alone; everything smaller merges into one.
 pub const COMPACTION_RETAINED_SEGMENTS: usize = 3;
 /// A segment holding at least this share of the corpus is never folded by background
@@ -548,9 +548,9 @@ impl SearchIndex {
         Self::open_or_create_for_ingest_with_merge_policy(dir, true)
     }
 
-    /// Search-triggered refreshes never merge in the foreground. Compaction runs in a
-    /// separate `memex index` process once the segment count passes
-    /// [`SEARCH_REFRESH_COMPACTION_SEGMENTS`].
+    /// Search-triggered refreshes never merge in the foreground. A detached
+    /// `memex index compact` process folds the small segments once their count passes
+    /// [`SEARCH_REFRESH_COMPACTION_SMALL_SEGMENTS`].
     pub fn open_or_create_for_search_refresh(dir: &Path) -> Result<Self> {
         let mut index = Self::open_or_create_for_ingest_with_merge_policy(dir, true)?;
         index.defer_merges = true;
@@ -2789,7 +2789,6 @@ mod tests {
         }
         writer.wait_merging_threads().unwrap();
         assert_eq!(index.segment_count().unwrap(), 6);
-        assert!(index.segment_count().unwrap() < SEARCH_REFRESH_COMPACTION_SEGMENTS);
     }
 
     #[test]

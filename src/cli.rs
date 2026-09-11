@@ -2296,8 +2296,6 @@ fn run_index_compact(root: Option<PathBuf>) -> Result<()> {
         println!("no index to compact");
         return Ok(());
     }
-    // The merge below runs without the ingest lease so searches keep working, so the lease
-    // cannot keep two compactions apart. This can.
     let Some(_compaction) = crate::lease::CompactionLock::try_acquire(&paths)? else {
         println!("compaction already running");
         return Ok(());

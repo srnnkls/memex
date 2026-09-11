@@ -529,9 +529,6 @@ pub fn federated_search(
                 scope.spawn(move || {
                     let result = search_local(&paths, &config, &spec, auto_index_local).map(
                         |mut records| {
-                            // The remote branch abbreviates in its RPC handler; the local
-                            // machine has to do it here or a federated result set would
-                            // carry two different text budgets.
                             spec.abbreviate(&mut records);
                             records
                         },
@@ -2623,7 +2620,7 @@ fn ensure_local_index(paths: &Paths, config: &UserConfig) -> Result<()> {
 fn schedule_compaction_if_fragmented(paths: &Paths) -> Result<()> {
     let small = SearchIndex::open_or_create(&paths.index)?
         .small_segment_count(crate::index::COMPACTION_RETAINED_SEGMENTS)?;
-    if small <= crate::index::SEARCH_REFRESH_COMPACTION_SEGMENTS {
+    if small <= crate::index::SEARCH_REFRESH_COMPACTION_SMALL_SEGMENTS {
         return Ok(());
     }
     if !matches!(
