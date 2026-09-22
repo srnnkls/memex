@@ -175,7 +175,8 @@ impl OAuthServer {
     pub(super) fn new(paths: &Paths, public_url: &str, owner: Arc<WebAuth>) -> Result<Self> {
         let origin = validate_public_origin(public_url)?;
         let resource = format!("{origin}{RESOURCE_PATH}");
-        let database = paths.root.join(DATABASE_FILE);
+        std::fs::create_dir_all(&paths.root)?;
+        let database = database_path(paths)?;
         let server = Self {
             origin,
             resource,
@@ -350,7 +351,10 @@ impl OAuthServer {
 }
 
 pub(super) fn revoke_all(paths: &Paths) -> Result<usize> {
-    let database = paths.root.join(DATABASE_FILE);
+    if !paths.root.exists() {
+        return Ok(0);
+    }
+    let database = database_path(paths)?;
     if !database.exists() {
         return Ok(0);
     }
@@ -1264,6 +1268,12 @@ fn prune_unapproved_clients_tx(transaction: &rusqlite::Transaction<'_>, now: i64
         params![now, UNAPPROVED_CLIENT_TTL_SECONDS],
     )?;
     Ok(())
+}
+
+/// The database is opened with SQLITE_OPEN_NOFOLLOW, which refuses a symlink in
+/// any component of its path, so the root it lives under is resolved first.
+fn database_path(paths: &Paths) -> Result<PathBuf> {
+    Ok(std::fs::canonicalize(&paths.root)?.join(DATABASE_FILE))
 }
 
 fn open_database_path(path: &Path, create: bool) -> Result<Connection> {

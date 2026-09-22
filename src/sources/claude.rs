@@ -19,8 +19,9 @@ use walkdir::WalkDir;
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
     // Preserve pre-reader fallback IDs independently of attachment-only messages,
-    // and classify background transcripts consistently across every record.
-    index: 8,
+    // classify background transcripts consistently across every record, and read
+    // messages queued while a turn runs.
+    index: 9,
     usage: 4,
 };
 
@@ -325,6 +326,31 @@ pub fn probe(path: &Path) -> Result<SourceMetadata> {
     })
 }
 
+/// Claude Code records a message the user sends while a turn is running only as
+/// a `queued_command` attachment, never as a `user` entry.
+fn queued_human_prompt(object: &simd_json::borrowed::Object<'_>) -> Option<String> {
+    use simd_json::prelude::*;
+    let attachment = object.get("attachment")?.as_object()?;
+    let origin = attachment.get("origin")?.as_object()?;
+    if attachment.get("type")?.as_str()? != "queued_command"
+        || origin.get("kind")?.as_str()? != "human"
+    {
+        return None;
+    }
+    let prompt = attachment.get("prompt")?;
+    let text = match prompt.as_array() {
+        Some(blocks) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(|value| value.as_str()) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>()
+            .join(" "),
+        None => prompt.as_str()?.to_string(),
+    };
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 #[cfg(test)]
 pub(crate) fn parse_index_records(
     path: &Path,
@@ -435,7 +461,12 @@ pub(crate) fn parse_index_records_with_background(
             .get("type")
             .and_then(|value| value.as_str())
             .unwrap_or("");
-        if entry_type != "user" && entry_type != "assistant" {
+        let queued_prompt = if entry_type == "attachment" {
+            queued_human_prompt(object)
+        } else {
+            None
+        };
+        if entry_type != "user" && entry_type != "assistant" && queued_prompt.is_none() {
             if !matches!(
                 entry_type,
                 "progress"
@@ -490,6 +521,27 @@ pub(crate) fn parse_index_records_with_background(
             .and_then(|value| value.as_str())
             .and_then(super::common::parse_iso_millis)
             .unwrap_or(0);
+        if let Some(text) = queued_prompt {
+            let mut links = entry_links;
+            links.source_record_offset = Some(source_record_offset);
+            emit(Record {
+                source: SourceKind::Claude,
+                doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                ts: timestamp,
+                project: project.clone(),
+                session_id: session_id.clone(),
+                turn_id,
+                role: "user".to_string(),
+                text,
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+                links,
+                source_path: source_path.clone(),
+            })?;
+            turn_id += 1;
+            continue;
+        }
         let Some(message) = object.get("message").and_then(|value| value.as_object()) else {
             continue;
         };
@@ -1038,6 +1090,92 @@ mod tests {
         assert_eq!(
             probe(&path).unwrap().session.conversation_kind,
             ConversationKind::Main
+        );
+    }
+
+    #[test]
+    fn queued_human_prompts_become_user_records_once() {
+        use crate::retrieval::canonical_record_id;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("queued.jsonl");
+        let lines = [
+            serde_json::json!({"type":"user", "uuid":"ask", "message":{"content":"First question"}}),
+            serde_json::json!({"type":"queue-operation", "operation":"enqueue", "content":"Also this"}),
+            serde_json::json!({"type":"queue-operation", "operation":"remove", "content":"Also this", "reason":"absorbed_mid_turn"}),
+            serde_json::json!({"type":"attachment", "uuid":"queued", "parentUuid":"ask",
+                "timestamp":"2026-09-22T18:57:28.394Z",
+                "attachment":{"type":"queued_command", "prompt":"Also this", "commandMode":"prompt",
+                    "origin":{"kind":"human"}, "humanTurn":true}}),
+            serde_json::json!({"type":"attachment", "uuid":"notice",
+                "attachment":{"type":"queued_command", "commandMode":"task-notification",
+                    "prompt":"<task-notification>done</task-notification>"}}),
+            serde_json::json!({"type":"attachment", "uuid":"pasted",
+                "attachment":{"type":"queued_command", "commandMode":"prompt", "origin":{"kind":"human"},
+                    "prompt":[{"type":"text", "text":"Pasted"}, {"type":"image", "source":{}}]}}),
+            serde_json::json!({"type":"assistant", "uuid":"answer", "message":{"content":"Answer"}}),
+        ];
+        let encoded = |lines: &[serde_json::Value]| {
+            lines
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>()
+        };
+        let parse = |state| {
+            let mut records = Vec::new();
+            let output = parse_index_records(&path, state, false, &AtomicU64::new(1), |record| {
+                records.push(record);
+                Ok(())
+            })
+            .unwrap();
+            (records, output)
+        };
+
+        fs::write(&path, encoded(&lines)).unwrap();
+        let (full, _) = parse(IndexParseState::default());
+        let said = full
+            .iter()
+            .map(|record| {
+                (
+                    record.role.as_str(),
+                    record.text.as_str(),
+                    record.links.event_id.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            said,
+            [
+                ("user", "First question", Some("ask")),
+                ("user", "Also this", Some("queued")),
+                ("user", "Pasted", Some("pasted")),
+                ("assistant", "Answer", Some("answer")),
+            ]
+        );
+        assert_eq!(full[1].links.parent_event_id.as_deref(), Some("ask"));
+        assert_eq!(full[1].ts, 1_790_103_448_394);
+        assert_eq!(
+            full.iter()
+                .map(|record| record.links.legacy_turn_id)
+                .collect::<Vec<_>>(),
+            [Some(0), None, None, Some(1)]
+        );
+
+        fs::write(&path, encoded(&lines[..3])).unwrap();
+        let (mut incremental, output) = parse(IndexParseState::default());
+        fs::write(&path, encoded(&lines)).unwrap();
+        let (rest, _) = parse(IndexParseState {
+            offset: output.offset,
+            turn_id: output.turn_id,
+            legacy_turn_id: output.legacy_turn_id,
+            pending_tool_calls: output.pending_tool_calls,
+        });
+        incremental.extend(rest);
+        assert_eq!(
+            incremental
+                .iter()
+                .map(canonical_record_id)
+                .collect::<Vec<_>>(),
+            full.iter().map(canonical_record_id).collect::<Vec<_>>()
         );
     }
 
