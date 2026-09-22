@@ -184,9 +184,8 @@ fn response_payload(response: Response) -> Value {
     body.lines()
         .filter_map(|line| line.strip_prefix("data:"))
         .map(str::trim)
-        .filter(|data| !data.is_empty())
+        .rfind(|data| !data.is_empty())
         .map(|data| serde_json::from_str(data).expect("JSON SSE event"))
-        .last()
         .unwrap_or_else(|| panic!("SSE response contained no data event: {body}"))
 }
 
