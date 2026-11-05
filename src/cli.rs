@@ -598,6 +598,7 @@ EXAMPLES:
     memex sessions                        # 20 most recent sessions as JSONL
     memex sessions --cwd .                # sessions from the current repo
     memex sessions --source claude --limit 5
+    memex sessions --session-id ID1 --session-id ID2   # rows for several exact IDs
     memex sessions --format json")]
     Sessions {
         /// Return one exact count object instead of session rows (unavailable totals are null)
@@ -609,9 +610,9 @@ EXAMPLES:
         /// Read one machine (defaults to local; ignores configured search defaults)
         #[arg(long)]
         machine: Option<String>,
-        /// Match this exact session ID
+        /// Match this exact session ID; repeat to match several
         #[arg(long)]
-        session_id: Option<String>,
+        session_id: Vec<String>,
         /// Match this exact indexed source path
         #[arg(long)]
         source_path: Option<String>,
@@ -627,9 +628,9 @@ EXAMPLES:
         /// Only include sessions active on or after this date/timestamp
         #[arg(long, value_name = "DATE_OR_TIMESTAMP")]
         since: Option<String>,
-        /// Maximum number of sessions
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
+        /// Maximum number of sessions [default: 20, or 20 per --session-id]
+        #[arg(long)]
+        limit: Option<usize>,
         /// Filter by origin: regular (default), interactive, subagent, or all (includes permission reviews)
         #[arg(long, value_enum, default_value_t = SessionOrigin::Regular)]
         origin: SessionOrigin,
@@ -1732,10 +1733,15 @@ pub fn run() -> Result<()> {
             } else {
                 origin
             };
+            let limit = limit.unwrap_or(SESSIONS_DEFAULT_LIMIT * session_id.len().max(1));
             if count {
+                anyhow::ensure!(
+                    session_id.len() <= 1,
+                    "--count accepts at most one --session-id"
+                );
                 let paths = Paths::new(root)?;
                 let request = SessionsRequest {
-                    session_id,
+                    session_id: session_id.into_iter().next(),
                     source_path,
                     cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
                     project,
@@ -2979,7 +2985,7 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
             check_analytics(&machine)?;
             let items = if machine == crate::machine::LOCAL_MACHINE_ID {
                 collect_sessions(
-                    filters.session_id,
+                    filters.session_id.as_slice(),
                     filters.source_path,
                     filters.cwd.map(PathBuf::from),
                     filters.project,
@@ -4887,9 +4893,11 @@ fn session_resume_command(
     Some((command, cwd))
 }
 
+const SESSIONS_DEFAULT_LIMIT: usize = 20;
+
 #[allow(clippy::too_many_arguments)]
 fn run_sessions(
-    session_id: Option<String>,
+    session_ids: Vec<String>,
     source_path: Option<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
@@ -4907,23 +4915,35 @@ fn run_sessions(
     {
         let paths = Paths::new(root)?;
         let config = UserConfig::load(&paths)?;
-        crate::machine::remote_sessions(
-            &config,
-            id,
-            SessionsRequest {
-                session_id,
-                source_path,
-                cwd: cwd.map(|value| value.to_string_lossy().to_string()),
-                project,
-                source: source.map(|value| value.as_str().to_string()),
-                since,
-                limit,
-                origin,
-            },
-        )?
+        let request = |session_id| SessionsRequest {
+            session_id,
+            source_path: source_path.clone(),
+            cwd: cwd
+                .as_ref()
+                .map(|value| value.to_string_lossy().to_string()),
+            project: project.clone(),
+            source: source.map(|value| value.as_str().to_string()),
+            since: since.clone(),
+            limit,
+            origin,
+        };
+        if session_ids.is_empty() {
+            crate::machine::remote_sessions(&config, id, request(None))?
+        } else {
+            let mut items = Vec::new();
+            for session_id in session_ids {
+                items.extend(crate::machine::remote_sessions(
+                    &config,
+                    id,
+                    request(Some(session_id)),
+                )?);
+            }
+            items.truncate(limit);
+            items
+        }
     } else {
         collect_sessions(
-            session_id,
+            &session_ids,
             source_path,
             cwd,
             project,
@@ -4955,7 +4975,7 @@ pub(crate) fn collect_projects(paths: &Paths, source: Option<SourceFilter>) -> R
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_sessions(
-    session_id: Option<String>,
+    session_ids: &[String],
     source_path: Option<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
@@ -4980,7 +5000,7 @@ pub(crate) fn collect_sessions(
         cwd_filter.as_deref(),
         since_ms,
         kind_filter,
-        session_id.as_deref(),
+        &session_ids.iter().map(String::as_str).collect::<Vec<_>>(),
         source_path.as_deref(),
         Some(limit),
     )?;
@@ -5098,7 +5118,7 @@ pub(crate) fn mcp_sessions(root: Option<PathBuf>, request: SessionsRequest) -> R
     validate_mcp_limit(request.limit)?;
     let source = parse_source_filter(request.source)?;
     let mut results = collect_sessions(
-        request.session_id,
+        request.session_id.as_slice(),
         request.source_path,
         request.cwd.map(PathBuf::from),
         request.project,
@@ -8119,11 +8139,11 @@ mod tests {
         else {
             panic!("expected sessions command");
         };
-        assert_eq!(session_id.as_deref(), Some("shared"));
+        assert_eq!(session_id, ["shared"]);
         assert_eq!(source_path.as_deref(), Some("/old session.jsonl"));
         assert_eq!(source, Some(SourceFilter::Codex));
         assert_eq!(origin, SessionOrigin::All);
-        assert_eq!(limit, 1);
+        assert_eq!(limit, Some(1));
         let defaults: SessionsRequest = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(defaults.session_id.is_none());
         assert!(defaults.source_path.is_none());

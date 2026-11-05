@@ -1940,7 +1940,7 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
         }),
         RpcOperation::Sessions { request } => Ok(RpcPayload::Sessions {
             sessions: crate::cli::collect_sessions(
-                request.session_id,
+                request.session_id.as_slice(),
                 request.source_path,
                 request.cwd.map(std::path::PathBuf::from),
                 request.project,
